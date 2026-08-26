@@ -9,6 +9,7 @@ import type {
   Workspace,
   WorkspaceColumn,
 } from "@/lib/workspace/types";
+import type { PersonRow } from "@/lib/ploid/types";
 
 const allowedTypes = new Set([
   "text",
@@ -29,30 +30,39 @@ export function validateOperations(
   workspace: Workspace,
   operations: TableOperation[],
 ) {
+  const columnIds = new Set(workspace.table.columns.map((column) => column.id));
+  const rowIds = new Set(workspace.table.rows.map((row) => row.id));
   for (const operation of operations) {
     if (
       operation.type === "add_column" &&
       (!operation.column.id ||
         !operation.column.name ||
-        !allowedTypes.has(operation.column.dataType))
+        !allowedTypes.has(operation.column.dataType) ||
+        columnIds.has(operation.column.id))
     )
       throw new Error("Invalid column operation");
-    if (
-      "columnId" in operation &&
-      !workspace.table.columns.some(
-        (column) => column.id === operation.columnId,
-      )
-    )
+    if (operation.type === "add_column") columnIds.add(operation.column.id);
+    if ("columnId" in operation && !columnIds.has(operation.columnId))
       throw new Error(`Unknown column: ${operation.columnId}`);
+    if (operation.type === "add_rows")
+      for (const row of operation.rows) {
+        if (!row.id || rowIds.has(row.id)) throw new Error("Invalid row operation");
+        for (const columnId of Object.keys(row.cells))
+          if (!columnIds.has(columnId)) throw new Error(`Unknown column: ${columnId}`);
+        rowIds.add(row.id);
+      }
     if (operation.type === "update_cells")
       for (const update of operation.updates)
         if (
-          !workspace.table.rows.some((row) => row.id === update.rowId) ||
-          !workspace.table.columns.some(
-            (column) => column.id === update.columnId,
-          )
+          !rowIds.has(update.rowId) ||
+          !columnIds.has(update.columnId)
         )
           throw new Error("Update references an unknown row or column");
+    if (operation.type === "delete_rows")
+      for (const rowId of operation.rowIds) {
+        if (!rowIds.has(rowId)) throw new Error(`Unknown row: ${rowId}`);
+        rowIds.delete(rowId);
+      }
   }
 }
 export const TableService = {
@@ -60,6 +70,7 @@ export const TableService = {
     const workspace = getWorkspace(workspaceId);
     if (!workspace) throw new Error("Workspace not found");
     validateOperations(workspace, operations);
+    const eventQueue = [] as ReturnType<typeof newEvent>[];
     for (const operation of operations) {
       const table = workspace.table;
       if (operation.type === "add_column") {
@@ -67,7 +78,7 @@ export const TableService = {
         table.rows.forEach((row) => {
           row.cells[operation.column.id] = null;
         });
-        emitWorkspaceEvent(
+        eventQueue.push(
           newEvent(workspaceId, "table.column.added", { operation }),
         );
       }
@@ -76,7 +87,7 @@ export const TableService = {
           (item) => item.id === operation.columnId,
         );
         if (column) Object.assign(column, operation.patch);
-        emitWorkspaceEvent(
+        eventQueue.push(
           newEvent(workspaceId, "table.column.updated", { operation }),
         );
       }
@@ -85,13 +96,29 @@ export const TableService = {
           (column) => column.id !== operation.columnId,
         );
         table.rows.forEach((row) => delete row.cells[operation.columnId]);
-        emitWorkspaceEvent(
+        // Remove bindings to deleted inputs so dependency views and later
+        // Function runs never retain a dangling column reference.
+        table.columns.forEach((column) => {
+          if (!column.functionBinding) return;
+          const inputBindings = Object.fromEntries(
+            Object.entries(column.functionBinding.inputBindings).filter(
+              ([, binding]) =>
+                binding.type !== "column" ||
+                binding.columnId !== operation.columnId,
+            ),
+          );
+          column.functionBinding = {
+            ...column.functionBinding,
+            inputBindings,
+          };
+        });
+        eventQueue.push(
           newEvent(workspaceId, "table.column.deleted", { operation }),
         );
       }
       if (operation.type === "add_rows") {
         table.rows.push(...operation.rows);
-        emitWorkspaceEvent(
+        eventQueue.push(
           newEvent(workspaceId, "table.rows.added", { operation }),
         );
       }
@@ -100,7 +127,7 @@ export const TableService = {
           const row = table.rows.find((item) => item.id === update.rowId);
           if (row) row.cells[update.columnId] = update.value;
         });
-        emitWorkspaceEvent(
+        eventQueue.push(
           newEvent(workspaceId, "table.cells.updated", { operation }),
         );
       }
@@ -108,7 +135,7 @@ export const TableService = {
         table.rows = table.rows.filter(
           (row) => !operation.rowIds.includes(row.id),
         );
-        emitWorkspaceEvent(
+        eventQueue.push(
           newEvent(workspaceId, "table.rows.deleted", { operation }),
         );
       }
@@ -126,9 +153,54 @@ export const TableService = {
         );
       }
     }
-    return saveWorkspace(workspace);
+    const saved = saveWorkspace(workspace);
+    eventQueue.forEach(emitWorkspaceEvent);
+    // Consumers that hydrate a mounted workbook use this atomic notification,
+    // rather than racing individual column/row notifications.
+    emitWorkspaceEvent(
+      newEvent(workspaceId, "table.operations.applied", { operations }),
+    );
+    return saved;
   },
   addColumn(workspaceId: string, column: WorkspaceColumn) {
     return this.applyOperations(workspaceId, [{ type: "add_column", column }]);
   },
+  addPeopleSearchRows(workspaceId: string, people: PersonRow[]) {
+    const workspace = getWorkspace(workspaceId);
+    if (!workspace) throw new Error("Workspace not found");
+    const operations = peopleSearchOperations(workspace, people);
+    if (operations.some((operation) => operation.type === "add_rows" && operation.rows.length))
+      return this.applyOperations(workspaceId, operations);
+    return workspace;
+  },
 };
+
+export function peopleSearchOperations(
+  workspace: Workspace,
+  people: PersonRow[],
+): TableOperation[] {
+    const columns: Array<[string, string, WorkspaceColumn["dataType"]]> = [
+      ["person_name", "Name", "text"],
+      ["person_contact", "Contact", "text"],
+      ["person_linkedin", "LinkedIn", "url"],
+    ];
+    const existing = new Set(workspace.table.columns.map((column) => column.id));
+    const existingRows = new Set(workspace.table.rows.map((row) => row.id));
+    const newPeople = people.filter((person) => !existingRows.has(person.id));
+    return [
+      ...columns
+        .filter(([id]) => !existing.has(id))
+        .map(([id, name, dataType]) => ({ type: "add_column" as const, column: { id, name, dataType } })),
+      {
+        type: "add_rows" as const,
+        rows: newPeople.map((person) => ({
+          id: person.id,
+          cells: {
+            person_name: person.name ?? null,
+            person_contact: person.email ?? null,
+            person_linkedin: person.linkedinUrl ?? null,
+          },
+        })),
+      },
+    ];
+}

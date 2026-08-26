@@ -11,8 +11,9 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { GripVertical, LoaderCircle } from "lucide-react";
+import { GripVertical, LoaderCircle, Play, Sparkles } from "lucide-react";
 import { ColumnHeaderMenu, ColumnTypeIcon } from "./ColumnHeaderMenu";
+import type { EnrichmentAction } from "./EnrichmentColumnSheet";
 import { DeleteColumnDialog } from "./DeleteColumnDialog";
 import { EditColumnSheet } from "./EditColumnSheet";
 import { RenameColumnDialog } from "./RenameColumnDialog";
@@ -26,70 +27,52 @@ import type {
 } from "@/lib/spreadsheet/columns";
 import type { SavedFunction } from "@/lib/spreadsheet/functions";
 import { convertColumnValues } from "@/lib/spreadsheet/typeConversion";
-import type { TableOperation, WorkspaceTable } from "@/lib/workspace/types";
+import type {
+  TableOperation,
+  WorkspaceColumn,
+  WorkspaceTable,
+} from "@/lib/workspace/types";
 import { useSessionState } from "@/hooks/use-session-state";
 
 type RunRequest = { limit: number | null; token: number } | null;
 type HistoryAction = { type: "undo" | "redo"; token: number } | null;
 type UniverApi = ReturnType<typeof createSpreadsheet>["univerAPI"];
-export type SpreadsheetColumn = ColumnDefinition & { width: number };
-const seedRows = [
-  ["OpenAI", "https://openai.com", 4000, "Ready"],
-  ["Stripe", "https://stripe.com", 8000, "Ready"],
-  ["Ramp", "https://ramp.com", 1200, "Ready"],
-  ["Anthropic", "https://anthropic.com", "", "Ready"],
-  ["Linear", "https://linear.app", "", "Ready"],
-];
+export type SpreadsheetColumn = ColumnDefinition &
+  Pick<WorkspaceColumn, "functionBinding"> & { width: number };
 const textWidth = (value: unknown) => String(value).length * 7.2;
 const fitColumnWidth = (name: string, values: unknown[]) =>
-  Math.min(
-    420,
-    Math.max(
-      96,
-      textWidth(name) + 76,
-      ...values.map((value) => textWidth(value) + 32),
-    ),
+  Math.max(
+    150,
+    textWidth(name) + 112,
+    ...values.map((value) => textWidth(value) + 32),
   );
-const initialColumns: SpreadsheetColumn[] = [
-  {
-    id: "company",
-    name: "Company",
-    dataType: "text",
-    description: "Company name",
+const fillViewportWidths = (
+  columns: SpreadsheetColumn[],
+  table: WorkspaceTable,
+  viewportWidth: number,
+) => {
+  const measured = columns.map((column) => ({
+    ...column,
     width: fitColumnWidth(
-      "Company",
-      seedRows.map((row) => row[0]),
+      column.name,
+      table.rows.map((row) => row.cells[column.id] ?? ""),
     ),
-  },
-  {
-    id: "website",
-    name: "Website",
-    dataType: "url",
-    width: fitColumnWidth(
-      "Website",
-      seedRows.map((row) => row[1]),
-    ),
-  },
-  {
-    id: "employees",
-    name: "Employees",
-    dataType: "number",
-    width: fitColumnWidth(
-      "Employees",
-      seedRows.map((row) => row[2]),
-    ),
-  },
-  {
-    id: "ai-research",
-    name: "AI Research",
-    dataType: "ai",
-    description: "AI-generated company summary",
-    width: fitColumnWidth(
-      "AI Research",
-      seedRows.map((row) => row[3]),
-    ),
-  },
-];
+  }));
+  const spare = Math.max(
+    0,
+    viewportWidth - measured.reduce((total, column) => total + column.width, 0),
+  );
+  const extraPerColumn = measured.length
+    ? Math.floor(spare / measured.length)
+    : 0;
+  return measured.map((column, index) => ({
+    ...column,
+    width:
+      column.width +
+      extraPerColumn +
+      (index === measured.length - 1 ? spare % measured.length : 0),
+  }));
+};
 const columnLetter = (index: number) => {
   let result = "";
   for (let value = index + 1; value > 0; value = Math.floor((value - 1) / 26))
@@ -106,43 +89,93 @@ const columnColors: Record<string, { header: string; cell: string }> = {
   red: { header: "#ffebeb", cell: "#fff6f6" },
   purple: { header: "#f3edff", cell: "#faf7ff" },
 };
-const spreadsheetColumns = (table?: WorkspaceTable): SpreadsheetColumn[] =>
-  table
-    ? table.columns.map((column) => ({
-        ...column,
-        width: fitColumnWidth(
-          column.name,
-          table.rows.map((row) => row.cells[column.id] ?? ""),
-        ),
-      }))
-    : initialColumns;
-function workbookData(table?: WorkspaceTable) {
-  const columns = table?.columns ?? initialColumns;
-  const rows =
-    table?.rows.map((row) =>
-      columns.map((column) => row.cells[column.id] ?? ""),
-    ) ?? seedRows;
+const spreadsheetColumns = (table: WorkspaceTable): SpreadsheetColumn[] =>
+  table.columns.map((column) => ({
+    ...column,
+    width: fitColumnWidth(
+      column.name,
+      table.rows.map((row) => row.cells[column.id] ?? ""),
+    ),
+  }));
+const columnsForTable = (
+  table: WorkspaceTable,
+  snapshot?: SpreadsheetColumn[] | null,
+) => {
+  const freshColumns = spreadsheetColumns(table);
+  if (!snapshot?.length) return freshColumns;
+
+  const freshById = new Map(freshColumns.map((column) => [column.id, column]));
+  const restored = snapshot.flatMap((column) => {
+    const fresh = freshById.get(column.id);
+    return fresh ? [{ ...fresh, ...column, width: fresh.width }] : [];
+  });
+  const restoredIds = new Set(restored.map((column) => column.id));
+  return [
+    ...restored,
+    ...freshColumns.filter((column) => !restoredIds.has(column.id)),
+  ];
+};
+const hyperlinkDestination = (value: unknown, dataType: ColumnDataType) => {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (dataType === "email") return `mailto:${text}`;
+  return /^https?:\/\//i.test(text) ? text : `https://${text}`;
+};
+const formulaString = (value: string) => value.replaceAll('"', '""');
+const displayCellValue = (
+  value: string | number | boolean | null | undefined,
+): string | number | boolean => value ?? "";
+function workbookData(table: WorkspaceTable) {
+  const columns = table.columns;
+  const rows = table.rows.map((row) =>
+    columns.map((column) => displayCellValue(row.cells[column.id])),
+  );
   return {
-    id: "companies",
-    name: "Companies",
+    id: table.id,
+    name: table.name,
     sheetOrder: ["sheet1"],
     sheets: {
       sheet1: {
         id: "sheet1",
-        name: "Companies",
+        name: table.name,
         cellData: Object.fromEntries(
           rows.map((row, r) => [
             r,
             Object.fromEntries(row.map((value, c) => [c, { v: value }])),
           ]),
         ),
-        rowCount: 100,
-        columnCount: 24,
+        rowCount: Math.max(rows.length, 1),
+        columnCount: Math.max(columns.length, 1),
         rowHeader: { width: 0, hidden: 1 },
         columnHeader: { height: 0, hidden: 1 },
       },
     },
   };
+}
+
+/**
+ * Snapshots contain presentation state, but the workspace table is canonical.
+ * A snapshot captured before Agent/Search added columns must never constrain
+ * ranges created from the current table.
+ */
+function workbookForTable(
+  table: WorkspaceTable,
+  snapshot?: IWorkbookData | null,
+) {
+  if (!snapshot) return workbookData(table);
+  const restored = structuredClone(snapshot);
+  const sheet = restored.sheets?.sheet1;
+  if (!sheet) return workbookData(table);
+  // A presentation snapshot can be captured before an async table hydration.
+  // Never let its cell matrix replace the selected table's canonical values.
+  const canonical = workbookData(table).sheets.sheet1;
+  sheet.name = table.name;
+  sheet.cellData = canonical.cellData;
+  sheet.columnCount = Math.max(sheet.columnCount ?? 1, table.columns.length, 1);
+  // The workspace table is canonical: do not retain placeholder rows from a
+  // presentation snapshot.
+  sheet.rowCount = Math.max(table.rows.length, 1);
+  return restored;
 }
 export type SpreadsheetSnapshot = IWorkbookData;
 
@@ -158,41 +191,60 @@ export function AiSpreadsheet({
   onColumnSnapshot,
   functions,
   onSaveFunction,
+  onRunFunctionColumn,
+  onDeleteColumn,
+  onEnrichColumn,
 }: {
   runRequest: RunRequest;
   historyAction: HistoryAction;
   addColumnRequest: {
     name: string;
     dataType: ColumnDataType;
+    description?: string;
     token: number;
   } | null;
   tableOperation?: TableOperation | null;
-  table?: WorkspaceTable;
+  table: WorkspaceTable;
   workbookSnapshot?: SpreadsheetSnapshot | null;
   onWorkbookSnapshot?: (snapshot: SpreadsheetSnapshot) => void;
   columnSnapshot?: SpreadsheetColumn[] | null;
   onColumnSnapshot?: (columns: SpreadsheetColumn[]) => void;
   functions: SavedFunction[];
   onSaveFunction: (value: SavedFunction) => void;
+  onRunFunctionColumn?: (
+    columnId: string,
+    limit: number | null,
+  ) => Promise<void> | void;
+  onDeleteColumn?: (columnId: string) => Promise<void> | void;
+  onEnrichColumn?: (columnId: string, action: EnrichmentAction) => void;
 }) {
+  // Univer owns a viewport, so the parent cannot naturally collapse to its
+  // cells. Keep large tables scrollable, but use a content-sized viewport for
+  // short tables instead of presenting a misleading blank grid.
+  const compactViewportHeight =
+    table.rows.length < 5
+      ? `${44 + Math.max(table.rows.length, 1) * 42 + 18}px`
+      : undefined;
   const containerRef = useRef<HTMLDivElement>(null);
-  const headerTrackRef = useRef<HTMLDivElement>(null);
+  const headerScrollerRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<UniverApi | null>(null);
-  const scrollXRef = useRef(0);
   const initialTableRef = useRef(table);
-  const rowIdsRef = useRef<string[]>(
-    table?.rows.map((row) => row.id) ??
-      seedRows.map((_, index) => `row_${index + 1}`),
-  );
+  const rowIdsRef = useRef<string[]>(table.rows.map((row) => row.id));
   const initialWorkbookSnapshotRef = useRef(workbookSnapshot);
+  const tableRef = useRef(table);
   const workbookSnapshotCallbackRef = useRef(onWorkbookSnapshot);
   const columnSnapshotCallbackRef = useRef(onColumnSnapshot);
   const columnsRef = useRef<SpreadsheetColumn[]>(
-    columnSnapshot ?? spreadsheetColumns(table),
+    columnsForTable(table, columnSnapshot),
   );
   const [status, setStatus] = useState("Ready");
-  const [columns, setColumns] = useState(
-    columnSnapshot ?? spreadsheetColumns(table),
+  const [runDialog, setRunDialog] = useState<{
+    column: SpreadsheetColumn;
+    limit: number | null;
+  } | null>(null);
+  const [queueingRun, setQueueingRun] = useState(false);
+  const [columns, setColumns] = useState(() =>
+    columnsForTable(table, columnSnapshot),
   );
   const [draggedColumn, setDraggedColumn] = useState<number | null>(null);
   const [activeIndex, setActiveIndex] = useSessionState<number | null>(
@@ -224,12 +276,25 @@ export function AiSpreadsheet({
     false,
   );
   const [conversionError, setConversionError] = useState<string | null>(null);
+  const [univerReady, setUniverReady] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState(0);
+  useEffect(() => {
+    tableRef.current = table;
+  }, [table]);
   useEffect(() => {
     workbookSnapshotCallbackRef.current = onWorkbookSnapshot;
   }, [onWorkbookSnapshot]);
   useEffect(() => {
     columnSnapshotCallbackRef.current = onColumnSnapshot;
   }, [onColumnSnapshot]);
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const observer = new ResizeObserver(([entry]) =>
+      setViewportWidth(entry.contentRect.width),
+    );
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, []);
   const activeColumn =
     activeIndex === null ? null : (columns[activeIndex] ?? null);
   const lastColumnLetter = useMemo(
@@ -239,8 +304,6 @@ export function AiSpreadsheet({
   useEffect(() => {
     columnsRef.current = columns;
     columnSnapshotCallbackRef.current?.(columns);
-    if (headerTrackRef.current)
-      headerTrackRef.current.style.transform = `translateX(${-scrollXRef.current}px)`;
   }, [columns]);
 
   useEffect(() => {
@@ -249,7 +312,7 @@ export function AiSpreadsheet({
     apiRef.current = univerAPI;
     const initialSnapshot = initialWorkbookSnapshotRef.current;
     const initialTable = initialTableRef.current;
-    univerAPI.createWorkbook(initialSnapshot ?? workbookData(initialTable));
+    univerAPI.createWorkbook(workbookForTable(initialTable, initialSnapshot));
     const unregister = registerAiFormula(univerAPI, (state) =>
       setStatus(
         state === "running"
@@ -262,32 +325,50 @@ export function AiSpreadsheet({
       ),
     );
     const sheet = univerAPI.getActiveWorkbook()?.getActiveSheet();
+    const initialLastColumn = columnLetter(
+      Math.max(0, initialTable.columns.length - 1),
+    );
+    const initialRowCount = Math.max(initialTable.rows.length, 1);
     sheet
-      ?.getRange("A1:X100")
+      ?.getRange(`A1:${initialLastColumn}${initialRowCount}`)
       .setWrapStrategy(univerAPI.Enum.WrapStrategy.CLIP);
-    if (!initialSnapshot && !initialTable)
-      sheet?.getRange("D1").setFormula('=AI("Summarize this company: " & A1)');
     spreadsheetColumns(initialTable).forEach((column, index) =>
       sheet?.setColumnWidth(index, column.width),
     );
-    if (!initialSnapshot && !initialTable)
-      seedRows.forEach((row, index) => {
+    initialTable.rows.forEach((row, rowIndex) => {
+      initialTable.columns.forEach((column, columnIndex) => {
+        if (column.dataType !== "url" && column.dataType !== "email") return;
+        const value = row.cells[column.id];
+        const destination = hyperlinkDestination(value, column.dataType);
+        if (!destination) return;
         void sheet
-          ?.getRange(`B${index + 1}`)
-          .setHyperLink(
-            String(row[1]),
-            String(row[1]).replace(/^https?:\/\//, ""),
-          );
+          ?.getRange(`${columnLetter(columnIndex)}${rowIndex + 1}`)
+          .setHyperLink(destination, String(value));
       });
-    const syncHeaderScroll = ({ scrollX }: { scrollX: number }) => {
-      scrollXRef.current = scrollX;
-      if (!headerTrackRef.current) return;
-      headerTrackRef.current.style.transform = `translateX(${-scrollX}px)`;
+    });
+    initialTable.rows.forEach((_row, rowIndex) => sheet?.autoFitRow(rowIndex));
+    const syncHeaderScroll = () => {
+      const scrollState = univerAPI
+        .getActiveWorkbook()
+        ?.getActiveSheet()
+        ?.getScrollState();
+      if (!scrollState || !headerScrollerRef.current) return;
+      // `Event.Scroll.scrollX` is the virtual scrollbar value, not a pixel
+      // viewport position. Reconstruct Univer's viewport pixel position from
+      // its current column and offset using this sheet's exact widths.
+      const scrollLeft =
+        columnsRef.current
+          .slice(0, scrollState.sheetViewStartColumn)
+          .reduce((total, column) => total + column.width, 0) +
+        scrollState.offsetX;
+      // Univer owns the body viewport. The header only mirrors it.
+      headerScrollerRef.current.scrollLeft = scrollLeft;
     };
     const scrollDisposable = univerAPI.addEvent(
       univerAPI.Event.Scroll,
       syncHeaderScroll,
     );
+    setUniverReady(true);
     let snapshotTimer: number | undefined;
     const snapshotDisposable = univerAPI.addEvent(
       univerAPI.Event.CommandExecuted,
@@ -308,17 +389,80 @@ export function AiSpreadsheet({
       unregister();
       univerAPI.dispose();
       apiRef.current = null;
+      setUniverReady(false);
     };
   }, []);
+  useEffect(() => {
+    if (!univerReady || !apiRef.current) return;
+    const sheet = apiRef.current.getActiveWorkbook()?.getActiveSheet();
+    if (!sheet) return;
+    const canonical = tableRef.current;
+    // Canonical workspace schema is authoritative. Presentation snapshots may
+    // not add columns, otherwise a stale snapshot can create out-of-bounds
+    // ranges after a worksheet changes shape.
+    const nextColumns = fillViewportWidths(
+      columnsForTable(canonical, columnsRef.current),
+      canonical,
+      viewportWidth,
+    );
+    sheet.setColumnCount(Math.max(canonical.columns.length, 1));
+    // Canonical state is written as one coherent range update. This runs only
+    // after complete workspace state is available, never from prose deltas.
+    const values = canonical.rows.map((row) =>
+      nextColumns.map((column) =>
+        displayCellValue(row.cells[column.id]),
+      ),
+    );
+    // Keep the worksheet exactly as large as its canonical table. New rows
+    // are added by a later table mutation, rather than preallocated blanks.
+    sheet.setRowCount(Math.max(canonical.rows.length, 1));
+    if (values.length && nextColumns.length)
+      sheet
+        .getRange(`A1:${columnLetter(nextColumns.length - 1)}${values.length}`)
+        .setValues(values);
+    // `setValues` replaces cell contents and clears Univer's hyperlink
+    // metadata. Reapply links as part of the same canonical hydration so URL
+    // and email columns are interactive as soon as their data arrives.
+    canonical.rows.forEach((row, rowIndex) => {
+      nextColumns.forEach((column, columnIndex) => {
+        if (column.dataType !== "url" && column.dataType !== "email") return;
+        const value = row.cells[column.id];
+        const destination = hyperlinkDestination(value, column.dataType);
+        if (!destination) return;
+        void sheet
+          .getRange(`${columnLetter(columnIndex)}${rowIndex + 1}`)
+          .setHyperLink(destination, String(value));
+      });
+      sheet.autoFitRow(rowIndex);
+    });
+    nextColumns.forEach((column, index) => {
+      const width = column.width;
+      sheet.setColumnWidth(index, width);
+      nextColumns[index] = { ...column, width };
+    });
+    rowIdsRef.current = canonical.rows.map((row) => row.id);
+    columnsRef.current = nextColumns;
+    setColumns(nextColumns);
+    if (process.env.NODE_ENV !== "production")
+      console.info("[Workspace timing] Univer apply complete");
+  }, [table, univerReady, viewportWidth]);
   useEffect(() => {
     if (!runRequest || !apiRef.current) return;
     const sheet = apiRef.current.getActiveWorkbook()?.getActiveSheet();
     if (!sheet) return;
-    const end = runRequest.limit === null ? 5 : Math.min(5, runRequest.limit);
+    const aiIndex = columnsRef.current.findIndex(
+      (column) => column.dataType === "ai",
+    );
+    if (aiIndex < 0 || !rowIdsRef.current.length) return;
+    const end =
+      runRequest.limit === null
+        ? rowIdsRef.current.length
+        : Math.min(rowIdsRef.current.length, runRequest.limit);
+    const sourceColumn = columnLetter(0);
     for (let row = 1; row <= end; row += 1)
       sheet
-        .getRange(`D${row}`)
-        .setFormula(`=AI("Summarize this company: " & A${row})`);
+        .getRange(`${columnLetter(aiIndex)}${row}`)
+        .setFormula(`=AI("Summarize " & ${sourceColumn}${row})`);
   }, [runRequest]);
   useEffect(() => {
     if (!historyAction || !apiRef.current) return;
@@ -332,17 +476,43 @@ export function AiSpreadsheet({
     if (!sheet) return;
     const width = fitColumnWidth(addColumnRequest.name, []);
     const index = columnsRef.current.length;
+    const sourceColumns = columnsRef.current;
     sheet.insertColumns(index, 1);
     sheet.setColumnWidth(index, width);
     sheet
-      .getRange(`${columnLetter(index)}1:${columnLetter(index)}100`)
+      .getRange(
+        `${columnLetter(index)}1:${columnLetter(index)}${Math.max(rowIdsRef.current.length, 1)}`,
+      )
       .setWrapStrategy(apiRef.current!.Enum.WrapStrategy.CLIP);
+    if (
+      addColumnRequest.dataType === "ai" &&
+      addColumnRequest.description?.trim()
+    ) {
+      const instruction = formulaString(addColumnRequest.description.trim());
+      const headers = formulaString(
+        sourceColumns.map((column) => column.name).join(", "),
+      );
+      for (let row = 1; row <= rowIdsRef.current.length; row += 1) {
+        const rowValues = sourceColumns
+          .map((_, sourceIndex) => columnLetter(sourceIndex) + row)
+          .join(' & " | " & ');
+        const prompt = headers
+          ? `"${instruction}\\nColumns: ${headers}\\nRow values: " & ${rowValues || '""'}`
+          : `"${instruction}"`;
+        sheet
+          .getRange(`${columnLetter(index)}${row}`)
+          .setFormula(`=AI(${prompt})`);
+      }
+    }
     setColumns((current) => [
       ...current,
       {
         id: `column-${addColumnRequest.token}`,
         name: addColumnRequest.name,
         dataType: addColumnRequest.dataType,
+        ...(addColumnRequest.description
+          ? { description: addColumnRequest.description }
+          : {}),
         width,
       },
     ]);
@@ -398,7 +568,30 @@ export function AiSpreadsheet({
             `A${firstRow + 1}:${columnLetter(Math.max(0, columnsRef.current.length - 1))}${firstRow + values.length}`,
           )
           .setValues(values);
+      operation.rows.forEach((row, rowOffset) => {
+        columnsRef.current.forEach((column, columnIndex) => {
+          if (column.dataType !== "url" && column.dataType !== "email") return;
+          const value = row.cells[column.id];
+          const destination = hyperlinkDestination(value, column.dataType);
+          if (!destination) return;
+          void sheet
+            .getRange(`${columnLetter(columnIndex)}${firstRow + rowOffset + 1}`)
+            .setHyperLink(destination, String(value));
+        });
+      });
       rowIdsRef.current.push(...operation.rows.map((row) => row.id));
+      const nextColumns = columnsRef.current.map((column, columnIndex) => {
+        const values = sheet
+          .getRange(
+            `${columnLetter(columnIndex)}1:${columnLetter(columnIndex)}${rowIdsRef.current.length}`,
+          )
+          .getValues()
+          .map((row) => row[0] ?? "");
+        const width = fitColumnWidth(column.name, values);
+        sheet.setColumnWidth(columnIndex, width);
+        return { ...column, width };
+      });
+      setColumns(nextColumns);
     }
     if (operation.type === "update_cells")
       operation.updates.forEach((update) => {
@@ -406,10 +599,36 @@ export function AiSpreadsheet({
           (column) => column.id === update.columnId,
         );
         const rowIndex = rowIdsRef.current.indexOf(update.rowId);
-        if (columnIndex >= 0 && rowIndex >= 0)
+        if (columnIndex >= 0 && rowIndex >= 0) {
           sheet
             .getRange(`${columnLetter(columnIndex)}${rowIndex + 1}`)
             .setValue(update.value ?? "");
+          const column = columnsRef.current[columnIndex];
+          const destination = hyperlinkDestination(
+            update.value,
+            column.dataType,
+          );
+          if (
+            destination &&
+            (column.dataType === "url" || column.dataType === "email")
+          )
+            void sheet
+              .getRange(`${columnLetter(columnIndex)}${rowIndex + 1}`)
+              .setHyperLink(destination, String(update.value));
+          const values = sheet
+            .getRange(
+              `${columnLetter(columnIndex)}1:${columnLetter(columnIndex)}${rowIdsRef.current.length}`,
+            )
+            .getValues()
+            .map((row) => row[0] ?? "");
+          const width = fitColumnWidth(column.name, values);
+          sheet.setColumnWidth(columnIndex, width);
+          setColumns((current) =>
+            current.map((item, index) =>
+              index === columnIndex ? { ...item, width } : item,
+            ),
+          );
+        }
       });
   }, [tableOperation]);
 
@@ -424,7 +643,9 @@ export function AiSpreadsheet({
     apiRef.current
       ?.getActiveWorkbook()
       ?.getActiveSheet()
-      ?.getRange(`${columnLetter(index)}1:${columnLetter(index)}100`)
+      ?.getRange(
+        `${columnLetter(index)}1:${columnLetter(index)}${Math.max(rowIdsRef.current.length, 1)}`,
+      )
       .setBackgroundColor(palette.cell);
     updateColumn(index, { color });
   };
@@ -436,7 +657,7 @@ export function AiSpreadsheet({
       return true;
     }
     const range = sheet.getRange(
-      `${columnLetter(index)}1:${columnLetter(index)}100`,
+      `${columnLetter(index)}1:${columnLetter(index)}${Math.max(rowIdsRef.current.length, 1)}`,
     );
     const converted = convertColumnValues(
       range.getValues(),
@@ -533,7 +754,9 @@ export function AiSpreadsheet({
     const sheet = apiRef.current?.getActiveWorkbook()?.getActiveSheet();
     const values =
       sheet
-        ?.getRange(`${columnLetter(index)}1:${columnLetter(index)}5`)
+        ?.getRange(
+          `${columnLetter(index)}1:${columnLetter(index)}${Math.max(rowIdsRef.current.length, 1)}`,
+        )
         .getValues()
         .map((row) => row[0] ?? "") ?? [];
     const width = fitColumnWidth(name, values);
@@ -549,7 +772,9 @@ export function AiSpreadsheet({
     const sheet = apiRef.current.getActiveWorkbook()?.getActiveSheet();
     if (!sheet) return;
     sheet.moveColumns(
-      sheet.getRange(`${columnLetter(from)}1:${columnLetter(from)}100`),
+      sheet.getRange(
+        `${columnLetter(from)}1:${columnLetter(from)}${Math.max(rowIdsRef.current.length, 1)}`,
+      ),
       to,
     );
     setColumns((current) => {
@@ -599,20 +824,25 @@ export function AiSpreadsheet({
   };
   const deleteColumn = () => {
     if (activeIndex === null || columns.length <= 1) return;
-    apiRef.current
-      ?.getActiveWorkbook()
-      ?.getActiveSheet()
-      ?.deleteColumn(activeIndex);
-    setColumns((current) =>
-      current.filter((_, index) => index !== activeIndex),
-    );
+    const columnId = columns[activeIndex]?.id;
+    if (!columnId) return;
+    void Promise.resolve(onDeleteColumn?.(columnId)).catch((error) => {
+      if (process.env.NODE_ENV !== "production")
+        console.error("[Table] column delete failed", error);
+    });
+    const sheet = apiRef.current?.getActiveWorkbook()?.getActiveSheet();
+    sheet?.deleteColumn(activeIndex);
+    sheet?.setColumnCount(Math.max(columns.length - 1, 1));
+    const nextColumns = columns.filter((_, index) => index !== activeIndex);
+    columnsRef.current = nextColumns;
+    setColumns(nextColumns);
     setDeleteOpen(false);
     setActiveIndex(null);
   };
   const sortColumn = (column: number, direction: "asc" | "desc") => {
     const sheet = apiRef.current?.getActiveWorkbook()?.getActiveSheet();
     if (!sheet) return;
-    const range = `A1:${lastColumnLetter}5`;
+    const range = `A1:${lastColumnLetter}${Math.max(1, rowIdsRef.current.length)}`;
     const values = sheet
       .getRange(range)
       .getValues()
@@ -631,7 +861,7 @@ export function AiSpreadsheet({
     const fn = functions.find((item) => item.id === functionId);
     const sheet = apiRef.current?.getActiveWorkbook()?.getActiveSheet();
     if (!fn || !sheet) return;
-    for (let row = 1; row <= 5; row += 1)
+    for (let row = 1; row <= rowIdsRef.current.length; row += 1)
       sheet
         .getRange(`${columnLetter(columnIndex)}${row}`)
         .setFormula(fn.template.replaceAll("{row}", String(row)));
@@ -642,72 +872,95 @@ export function AiSpreadsheet({
   };
 
   return (
-    <div className="univer-shell">
-      <div className="univer-status">
-        <Badge
-          variant={status === "Failed" ? "destructive" : "secondary"}
-          className="gap-1 text-[10px]"
-        >
-          {status === "Running" && (
-            <LoaderCircle className="size-3 animate-spin" />
-          )}
-          {status}
-        </Badge>
-      </div>
-      <div className="custom-column-header">
-        <div ref={headerTrackRef} className="custom-column-track">
-          {columns.map((column, index) => (
-            <div
-              key={column.id}
-              className="custom-column"
-              style={{
-                width: column.width,
-                backgroundColor: (
-                  columnColors[column.color ?? "default"] ??
-                  columnColors.default
-                ).header,
-              }}
-              draggable
-              onDragStart={() => setDraggedColumn(index)}
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={() => {
-                if (draggedColumn !== null) moveColumn(draggedColumn, index);
-                setDraggedColumn(null);
-              }}
-            >
-              <div className="flex min-w-0 items-center gap-2">
-                <ColumnTypeIcon type={column.dataType} />
-                <span className="truncate">{column.name}</span>
-              </div>
-              <div className="flex items-center">
-                <GripVertical className="column-drag-hint size-3.5" />
-                <ColumnHeaderMenu
-                  columnName={column.name}
-                  dataType={column.dataType}
-                  onRename={() => openAction(index, () => setRenameOpen(true))}
-                  onEdit={() => openAction(index, () => setEditOpen(true))}
-                  onInsert={(side) => insertColumn(index, side)}
-                  onDuplicate={() => duplicateColumn(index)}
-                  onDelete={() => openAction(index, () => setDeleteOpen(true))}
-                  onSort={(direction) => sortColumn(index, direction)}
-                  onDataType={(dataType) => selectDataType(index, dataType)}
-                  onColor={(color) => applyColumnColor(index, color)}
-                  onTextToColumns={() =>
-                    openAction(index, () => setTextSplitOpen(true))
-                  }
-                  onSaveFunction={() =>
-                    openAction(index, () => setSaveFunctionOpen(true))
-                  }
-                  onDependencies={() =>
-                    openAction(index, () => setDependenciesOpen(true))
-                  }
-                />
-              </div>
-            </div>
-          ))}
+    <div
+      className={`univer-viewport${compactViewportHeight ? " univer-viewport--compact" : ""}`}
+      style={
+        compactViewportHeight ? { height: compactViewportHeight } : undefined
+      }
+    >
+      <div className="univer-shell">
+        <div className="univer-status">
+          <Badge
+            variant={status === "Failed" ? "destructive" : "secondary"}
+            className="gap-1 text-[10px]"
+          >
+            {status === "Running" && (
+              <LoaderCircle className="size-3 animate-spin" />
+            )}
+            {status}
+          </Badge>
         </div>
+        <div ref={headerScrollerRef} className="custom-column-header">
+          <div
+            className="custom-column-track"
+            style={{
+              width: columns.reduce((total, column) => total + column.width, 0),
+            }}
+          >
+            {columns.map((column, index) => (
+              <div
+                key={column.id}
+                className="custom-column"
+                style={{
+                  width: column.width,
+                  backgroundColor: (
+                    columnColors[column.color ?? "default"] ??
+                    columnColors.default
+                  ).header,
+                }}
+                draggable
+                onDragStart={() => setDraggedColumn(index)}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={() => {
+                  if (draggedColumn !== null) moveColumn(draggedColumn, index);
+                  setDraggedColumn(null);
+                }}
+              >
+                <div className="flex min-w-0 flex-1 items-center gap-2">
+                  {column.functionBinding ? (
+                    <Sparkles className="size-3.5 text-primary" />
+                  ) : (
+                    <ColumnTypeIcon type={column.dataType} />
+                  )}
+                  <span className="truncate">{column.name}</span>
+                </div>
+                <div className="flex shrink-0 items-center">
+                  <GripVertical className="column-drag-hint size-3.5" />
+                  <ColumnHeaderMenu
+                    columnName={column.name}
+                    dataType={column.dataType}
+                    onRename={() =>
+                      openAction(index, () => setRenameOpen(true))
+                    }
+                    onEdit={() => openAction(index, () => setEditOpen(true))}
+                    onInsert={(side) => insertColumn(index, side)}
+                    onDuplicate={() => duplicateColumn(index)}
+                    onDelete={() =>
+                      openAction(index, () => setDeleteOpen(true))
+                    }
+                    onSort={(direction) => sortColumn(index, direction)}
+                    onDataType={(dataType) => selectDataType(index, dataType)}
+                    onColor={(color) => applyColumnColor(index, color)}
+                    onTextToColumns={() =>
+                      openAction(index, () => setTextSplitOpen(true))
+                    }
+                    onSaveFunction={() =>
+                      openAction(index, () => setSaveFunctionOpen(true))
+                    }
+                    onDependencies={() =>
+                      openAction(index, () => setDependenciesOpen(true))
+                    }
+                    isFunctionColumn={!!column.functionBinding}
+                    onRun={(limit) => setRunDialog({ column, limit })}
+                    onEnrich={(action) => onEnrichColumn?.(column.id, action)}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div ref={containerRef} className="univer-container" />
       </div>
-      <div ref={containerRef} className="univer-container" />
       <RenameColumnDialog
         open={renameOpen}
         name={activeColumn?.name ?? ""}
@@ -717,6 +970,59 @@ export function AiSpreadsheet({
           setRenameOpen(false);
         }}
       />
+      <Dialog
+        open={!!runDialog}
+        onOpenChange={(open) => !open && setRunDialog(null)}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Run {runDialog?.column.name}</DialogTitle>
+            <DialogDescription>
+              {runDialog?.limit === null
+                ? `Queue this Function-backed column for all ${table.rows.length} rows.`
+                : `Queue this Function-backed column for the first ${Math.min(runDialog?.limit ?? 5, table.rows.length)} rows.`}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-md border bg-muted/30 p-3 text-sm">
+            <div className="flex items-center gap-2">
+              <Play className="size-4 text-primary" />
+              <span className="font-medium">Function Runner</span>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Rows run with controlled concurrency and update this table as
+              results complete.
+            </p>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setRunDialog(null)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={queueingRun}
+              onClick={async () => {
+                if (!runDialog || !onRunFunctionColumn) return;
+                setQueueingRun(true);
+                try {
+                  await onRunFunctionColumn(
+                    runDialog.column.id,
+                    runDialog.limit,
+                  );
+                  setRunDialog(null);
+                } finally {
+                  setQueueingRun(false);
+                }
+              }}
+            >
+              <Play className="size-4" />
+              {queueingRun
+                ? "Queueing…"
+                : runDialog?.limit === null
+                  ? "Run all"
+                  : "Run first 5"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
       {editOpen && (
         <EditColumnSheet
           open={editOpen}
@@ -754,9 +1060,13 @@ export function AiSpreadsheet({
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-2 text-sm">
-            <span>AI Research</span>
-            <span>Company Summary</span>
-            <span>Personalized Email</span>
+            {functions.length ? (
+              functions.map((fn) => <span key={fn.id}>{fn.name}</span>)
+            ) : (
+              <span className="text-muted-foreground">
+                No saved functions use this column yet.
+              </span>
+            )}
           </div>
           <Button onClick={() => setDependenciesOpen(false)}>Done</Button>
         </DialogContent>

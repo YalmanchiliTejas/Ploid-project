@@ -21,6 +21,7 @@ import {
   MoreHorizontal,
   Palette,
   Pencil,
+  Play,
   Percent,
   Settings2,
   Sigma,
@@ -42,6 +43,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { dataTypes, type ColumnDataType } from "@/lib/spreadsheet/columns";
+import type { EnrichmentAction } from "./EnrichmentColumnSheet";
 
 const typeIcons: Record<ColumnDataType, typeof Type> = {
   text: Type,
@@ -88,6 +90,9 @@ type Props = {
   onTextToColumns: () => void;
   onSaveFunction: () => void;
   onDependencies: () => void;
+  onEnrich?: (action: EnrichmentAction) => void;
+  isFunctionColumn?: boolean;
+  onRun?: (limit: number | null) => void;
 };
 
 export function ColumnHeaderMenu({
@@ -104,6 +109,9 @@ export function ColumnHeaderMenu({
   onTextToColumns,
   onSaveFunction,
   onDependencies,
+  onEnrich,
+  isFunctionColumn = false,
+  onRun,
 }: Props) {
   return (
     <DropdownMenu>
@@ -213,11 +221,57 @@ export function ColumnHeaderMenu({
           <Cpu className="size-4" />
           Save as function
         </DropdownMenuItem>
+        {onEnrich && (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <Sparkles className="size-4" />
+              Enrich this column
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="w-48">
+              {(
+                [
+                  ["Find work email", "work_email"],
+                  ["Find phone", "phone"],
+                  ["Enrich person", "person"],
+                  ["Social profile", "social"],
+                  ["LinkedIn profile", "linkedin"],
+                  ["GitHub profile", "github"],
+                  ["X profile", "x"],
+                  ["Instagram profile", "instagram"],
+                  ["TikTok profile", "tiktok"],
+                  ["YouTube profile", "youtube"],
+                  ["Reddit profile", "reddit"],
+                  ["Facebook profile", "facebook"],
+                ] as Array<[string, EnrichmentAction]>
+              ).map(([label, action]) => (
+                <DropdownMenuItem
+                  key={action}
+                  onSelect={() => onEnrich(action)}
+                >
+                  {label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        )}
         <DropdownMenuItem onSelect={onTextToColumns}>
           <Columns3 className="size-4" />
           Text to columns
         </DropdownMenuItem>
         <DropdownMenuSeparator />
+        {isFunctionColumn && onRun && (
+          <>
+            <DropdownMenuItem onSelect={() => onRun(5)}>
+              <Play className="size-4" />
+              Run first 5
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => onRun(null)}>
+              <Play className="size-4" />
+              Run all
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
         <DropdownMenuItem onSelect={() => onSort("asc")}>
           <ArrowDownAZ className="size-4" />
           Sort A → Z

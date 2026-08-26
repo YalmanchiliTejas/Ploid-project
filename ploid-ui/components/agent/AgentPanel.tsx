@@ -58,6 +58,7 @@ export function AgentPanel({
       });
       const payload = (await response.json()) as {
         message?: string;
+        structuredOutputError?: string;
         error?: string;
       };
       if (!response.ok)
@@ -68,7 +69,9 @@ export function AgentPanel({
         {
           id: `reply_${Date.now()}`,
           role: "assistant",
-          content: payload.message ?? "Research complete.",
+          content: payload.structuredOutputError
+            ? `${payload.message ?? "Research complete."}\n\nTable changes were not applied: ${payload.structuredOutputError}. You can retry this request.`
+            : (payload.message ?? "Research complete."),
           createdAt: new Date().toISOString(),
         },
       ]);

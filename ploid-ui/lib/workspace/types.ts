@@ -1,4 +1,6 @@
 import type { ColumnDataType } from "@/lib/spreadsheet/columns";
+import type { PersonRow } from "@/lib/ploid/types";
+import type { WorkspaceKind } from "./default-table-schema";
 
 export type WorkspaceColumn = {
   id: string;
@@ -24,6 +26,9 @@ export type FunctionBinding = {
     string,
     { type: "column" | "static"; columnId?: string; value?: string }
   >;
+  /** Embedded revision lets a Function-backed column hydrate across API route
+   * bundles/process restarts instead of relying only on an in-memory registry. */
+  definition?: unknown;
 };
 export type WorkspaceMessage = {
   id: string;
@@ -31,14 +36,44 @@ export type WorkspaceMessage = {
   content: string;
   createdAt: string;
 };
+export type AgentTurn = {
+  id: string;
+  prompt: string;
+  output: string;
+  structuredOutput?: unknown;
+  artifacts: unknown[];
+  inputRequests: unknown[];
+  acuUsed?: number;
+  requestId?: string;
+  createdAt: string;
+};
+export type WorkspaceNotice = {
+  id: string;
+  level: "warning";
+  message: string;
+  requestId?: string;
+  createdAt: string;
+};
+export type PeopleSearch = {
+  id: string;
+  rows: PersonRow[];
+  warning?: string;
+  requestId?: string;
+  createdAt: string;
+};
 export type Workspace = {
   id: string;
   name: string;
+  /** Undefined only for workspaces created before starter schemas existed. */
+  kind?: WorkspaceKind;
   tableId: string;
   ploidSessionId?: string;
   table: WorkspaceTable;
   tables: WorkspaceTable[];
   messages: WorkspaceMessage[];
+  agentTurns: AgentTurn[];
+  notices: WorkspaceNotice[];
+  peopleSearches: PeopleSearch[];
   createdAt: string;
   updatedAt: string;
 };
@@ -70,5 +105,10 @@ export type WorkspaceEvent = {
   id: string;
   type: string;
   workspaceId: string;
-  data?: { text?: string; operation?: TableOperation; [key: string]: unknown };
+  data?: {
+    text?: string;
+    operation?: TableOperation;
+    operations?: TableOperation[];
+    [key: string]: unknown;
+  };
 };

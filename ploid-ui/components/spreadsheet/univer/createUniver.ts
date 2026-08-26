@@ -21,8 +21,8 @@ export function createSpreadsheet(container: HTMLElement) {
         container,
         header: false,
         toolbar: false,
-        formulaBar: true,
-        footer: { sheetBar: false, statisticBar: true },
+        formulaBar: false,
+        footer: false,
         menu: {
           "sheet.operation.insert-hyper-link-toolbar": { hidden: true },
           "sheet.operation.insert-hyper-link-toolbar-zen-editor": {

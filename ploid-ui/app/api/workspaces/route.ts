@@ -1,10 +1,19 @@
-import { createWorkspace, listWorkspaces } from "@/lib/workspace/store";
+import {
+  createWorkspace,
+  getWorkspace,
+  listWorkspaces,
+} from "@/lib/workspace/store";
+
 export async function GET() {
   return Response.json({ data: listWorkspaces() });
 }
 export async function POST(request: Request) {
   try {
-    const body = (await request.json()) as { name?: unknown; kind?: unknown };
+    const body = (await request.json()) as {
+      name?: unknown;
+      kind?: unknown;
+      prompt?: unknown;
+    };
     if (typeof body.name !== "string" || !body.name.trim())
       return Response.json(
         { error: "A worksheet name is required" },
@@ -19,8 +28,15 @@ export async function POST(request: Request) {
         { error: "Choose people, companies, or markets" },
         { status: 400 },
       );
+    const workspace = createWorkspace({
+      name: body.name.trim(),
+      kind: body.kind,
+    });
     return Response.json(
-      createWorkspace({ name: body.name.trim(), kind: body.kind }),
+      {
+        workspace: getWorkspace(workspace.id),
+        initialSearchComplete: false,
+      },
       { status: 201 },
     );
   } catch (error) {

@@ -22,10 +22,12 @@ export function AddColumnDialog({
   open,
   onOpenChange,
   onCreate,
+  onUseAi,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreate: (column: { name: string; dataType: ColumnDataType }) => void;
+  onUseAi: () => void;
 }) {
   const [name, setName] = useSessionState("ploid:add-column:name", "");
   const [dataType, setDataType] = useSessionState<ColumnDataType>(
@@ -68,6 +70,20 @@ export function AddColumnDialog({
                   ))}
               </SelectContent>
             </Select>
+          </div>
+          <div className="border-t pt-3">
+            <p className="mb-2 text-xs font-medium text-muted-foreground">AI</p>
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full justify-start"
+              onClick={() => {
+                onOpenChange(false);
+                onUseAi();
+              }}
+            >
+              ✨ Use AI
+            </Button>
           </div>
         </div>
         <DialogFooter>

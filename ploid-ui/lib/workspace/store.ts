@@ -1,4 +1,5 @@
 import type { Workspace, WorkspaceEvent, WorkspaceTable } from "./types";
+import { defaultTableColumns, type WorkspaceKind } from "./default-table-schema";
 
 const now = () => new Date().toISOString();
 type WorkspaceRuntime = {
@@ -14,29 +15,6 @@ const sharedRuntime = runtime.__ploidWorkspaceRuntime ?? {
 };
 runtime.__ploidWorkspaceRuntime = sharedRuntime;
 const { workspaces, listeners } = sharedRuntime;
-const tableTemplates: Record<
-  "people" | "companies" | "markets",
-  Array<[string, "text" | "url" | "email"]>
-> = {
-  people: [
-    ["Name", "text"],
-    ["LinkedIn", "url"],
-    ["Company", "text"],
-    ["Work Email", "email"],
-  ],
-  companies: [
-    ["Company", "text"],
-    ["Website", "url"],
-    ["Industry", "text"],
-    ["Employees", "text"],
-  ],
-  markets: [
-    ["Market", "text"],
-    ["Region", "text"],
-    ["Segment", "text"],
-    ["Notes", "text"],
-  ],
-};
 
 export function listWorkspaces() {
   return [...workspaces.values()].map(
@@ -60,22 +38,19 @@ export function saveWorkspace(workspace: Workspace) {
 }
 export function createWorkspace(input: {
   name: string;
-  kind: "people" | "companies" | "markets";
+  kind: WorkspaceKind;
 }) {
   const id = `workspace_${crypto.randomUUID()}`;
   const table: WorkspaceTable = {
     id: `table_${crypto.randomUUID()}`,
     name: input.name,
-    columns: tableTemplates[input.kind].map(([name, dataType]) => ({
-      id: `col_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`,
-      name,
-      dataType,
-    })),
+    columns: defaultTableColumns(input.kind),
     rows: [],
   };
   return saveWorkspace({
     id,
     name: input.name,
+    kind: input.kind,
     tableId: table.id,
     table,
     tables: [table],
@@ -85,10 +60,13 @@ export function createWorkspace(input: {
       {
         id: `message_${crypto.randomUUID()}`,
         role: "assistant",
-        content: `Your ${input.kind} worksheet is ready. Ask Ploid Agent to research and populate it.`,
+        content: `Ploid Agent will design and populate this ${input.kind} table from your research request.`,
         createdAt: now(),
       },
     ],
+    agentTurns: [],
+    notices: [],
+    peopleSearches: [],
   });
 }
 export function addTable(workspaceId: string, name: string) {
@@ -111,6 +89,14 @@ export function selectTable(workspaceId: string, tableId: string) {
   if (!workspace || !table) throw new Error("Table not found");
   workspace.tableId = tableId;
   workspace.table = table;
+  return saveWorkspace(workspace);
+}
+export function renameTable(workspaceId: string, tableId: string, name: string) {
+  const workspace = getWorkspace(workspaceId);
+  const table = workspace?.tables.find((item) => item.id === tableId);
+  if (!workspace || !table) throw new Error("Table not found");
+  table.name = name;
+  if (workspace.tableId === tableId) workspace.table = table;
   return saveWorkspace(workspace);
 }
 export function emitWorkspaceEvent(event: WorkspaceEvent) {
