@@ -1,0 +1,35 @@
+[[source]]
+url = "https://pypi.python.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+tweepy = "*"
+google-api-python-client = "*"
+lxml = "*"
+instagram-private-api = "==1.6.0"
+nest-asyncio = "*"
+requests = "*"
+cchardet = "*"
+aiodns = "*"
+brotlipy = "*"
+aiohttp = "*"
+linkedin-api = "==2.0.0a3"
+python-dotenv = "*"
+fingerprint = "*"
+numpy = "*"
+PyQt5 = "*"
+bs4 = "*"
+emoji = "*"
+fpdf2 = "*"
+certifi = "*"
+
+[dev-packages]
+pylint = "*"
+tox = "*"
+flake8 = "*"
+sphinx = "*"
+sphinx-rtd-theme = "*"
+
+[requires]
+python_version = "3.8"  # can be changed to 3.9

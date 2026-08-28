@@ -1,0 +1,10 @@
+# Dependencies for the LinkedIn-to-Instagram lookup CLI.
+# DDGS uses DuckDuckGo search with no API key. The legacy GUI's Twitter and
+# Instagram scraping dependencies are intentionally excluded.
+ddgs
+linkedin-scraper
+python-dotenv
+# Optional local LinkedIn-avatar to Instagram-avatar reranking.
+insightface
+onnxruntime
+opencv-python-headless

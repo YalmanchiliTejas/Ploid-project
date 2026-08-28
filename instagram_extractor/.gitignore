@@ -1,0 +1,32 @@
+.vscode/
+__pycache__/
+avatar_cache/
+linkedin_session.json
+.env
+instagram_profiles*.json
+linkedin_urls.txt
+.git.original-social-media-profiler/
+.idea/
+.tox/
+**/cookie_settings.json
+app/backend/scraping/.env
+
+# Escaping fonts (fpdf2 previous versions)
+app/backend/visualization/fonts/OpenSans-Bold.cw127.pkl
+app/backend/visualization/fonts/OpenSans-Bold.pkl
+app/backend/visualization/fonts/OpenSans-BoldItalic.pkl
+app/backend/visualization/fonts/OpenSans-Italic.pkl
+app/backend/visualization/fonts/OpenSans-Regular.cw127.pkl
+app/backend/visualization/fonts/OpenSans-Regular.pkl
+app/backend/visualization/fonts/OpenSans-Italic.cw127.pkl
+
+# Escaping fonts (fpdf2 recent versions)
+OpenSans-Bold.cw127.pkl
+OpenSans-Bold.pkl
+OpenSans-BoldItalic.pkl
+OpenSans-Italic.pkl
+OpenSans-Regular.cw127.pkl
+OpenSans-Regular.pkl
+OpenSans-Italic.cw127.pkl
+./env
+**/.DS_Store
