@@ -61,8 +61,6 @@ All this beauty takes several steps...
    IPSTACK_API_KEY=
    LINKEDIN_LOGIN=
    LINKEDIN_PASSWORD=
-   INSTAGRAM_LOGIN=
-   INSTAGRAM_PASSWORD=
    TWITTER_API_KEY=
    TWITTER_API_SECRET=
    TWITTER_ACCESS_TOKEN=
@@ -70,7 +68,7 @@ All this beauty takes several steps...
 
 Explanation on the provided credentials can be read on the `bottom <https://github.com/pandrey2003/social-media-profiler#explanations-on-environment-variables>`_ of the README. The setup happens only once.
 
-*Note:* the caching algorithm has been enabled for Instagram interaction, which allows you to renew your cache settings only once per 2 months. LinkedIn throttling limit is 900 API calls/hour.
+*Note:* LinkedIn throttling limit is 900 API calls/hour.
 
 2. Install all the dependencies from ``Pipfile`` and ``Pipfile.lock`` using `pipenv <https://github.com/pypa/pipenv>`_:
 
@@ -116,7 +114,6 @@ Explanations on environment variables
 - ``GOOGLE_CSE_ID`` is your `Google Custom Search Engine <https://cse.google.com/>`_ ID (you have to set it up to search the info all around the web).
 - ``IPSTACK_API_KEY`` is your API key from `ipstack <https://ipstack.com/>`_. If you do not have it, this is a 2-minute procedure.
 - ``LINKEDIN_LOGIN`` and ``LINKEDIN_PASSWORD`` are the login and the password to your LinkedIn profile (no API-related credentials needed).
-- ``INSTAGRAM_LOGIN`` and ``INSTAGRAM_PASSWORD`` are the login and the password to your Instagram profile (no API-related credentials needed).
 - For the following Twitter credentials, you have to create an app at `Twitter Developers Portal <https://developer.twitter.com/en>`_. After this, you get ``TWITTER_API_KEY`` and ``TWITTER_API_SECRET`` from your app page. Your access token and access token secret can be received using the ``tweepy`` library. In case you do not know how to get it, watch this `tutorial <https://www.youtube.com/watch?v=dvAurfBB6Jk>`_ up to 12:45 minutes. The access token and the access token secret are *permanent*, so this set up happens only once.
 
 Advanced explanation on GUI input
@@ -129,6 +126,73 @@ Advanced explanation on GUI input
 - The button 4 is used to choose the PDF output directory on your PC. Mandatory: visualization is an essential logical part of the app.
 - The button 5 sends all your input data and the output directory to the logical part of the project. Press on it when you are sure you have entered all the necessary information.
 - The progress bar 6 reflects the progress of the logical part of the project (no your interaction, just to see the progress). 2% means scraping has already started, 60% means scraping has been done and your data is being analyzed, 75% indicates analysis has been done and the data is being visualized, 100% - you can see the PDF file in the requested directory.
+
+LinkedIn-to-Instagram face evidence
+-----------------------------------
+
+The batch enrichment command treats face evidence as ``match``, ``mismatch``,
+or ``inconclusive``. It downloads the largest image advertised by a public
+page, downloads the largest authenticated LinkedIn ``srcset`` image when
+available, evaluates every detected face, and records face size, detection
+confidence, blur, pitch/yaw/roll, landmark coverage, alignment quality,
+occlusion risk, and a composite recognition-quality score.
+
+Images with faces smaller than 64 by 64 pixels, heavy blur, extreme pose, or
+unreliable alignment are inconclusive. A multi-face candidate can contribute a
+positive match, but never a mismatch penalty. Associated public Instagram post
+images are compared when an indexed result ties the post to the exact handle;
+recurring faces are combined into a quality-weighted template.
+
+When the leading result remains ``ambiguous`` or its face evidence is
+``inconclusive``, the resolver automatically performs a focused second pass.
+It combines the LinkedIn workplace and location with each shortlisted
+Instagram handle, gathers newly indexed profile/post context and photos, and
+then reruns face comparison and the normal verification gates. Batch runs can
+reprocess older ambiguous/inconclusive records with ``--retry-ambiguous``.
+
+The quality gates can be adjusted in ``.env``::
+
+   FACE_MATCH_MIN_FACE_SIZE=64
+   FACE_MATCH_MIN_DETECTION_SCORE=0.75
+   FACE_MATCH_MIN_BLUR_SCORE=35
+   FACE_MATCH_MAX_ABS_POSE=35
+   FACE_MATCH_MIN_LANDMARK_COVERAGE=0.8
+   FACE_MATCH_MIN_ALIGNMENT_SCORE=0.6
+
+Threshold calibration
+~~~~~~~~~~~~~~~~~~~~~
+
+Create a labeled JSON file with same-person and different-person pairs from
+the same image sources used in production::
+
+   {
+     "pairs": [
+       {
+         "reference_paths": ["labeled/linkedin/alice.jpg"],
+         "candidate_paths": ["labeled/instagram/alice-1.jpg", "labeled/instagram/alice-2.jpg"],
+         "same_person": true
+       },
+       {
+         "reference_path": "labeled/linkedin/alice.jpg",
+         "candidate_path": "labeled/instagram/bob.jpg",
+         "same_person": false
+       }
+     ]
+   }
+
+Calibrate conservative match and mismatch thresholds::
+
+   python calibrate_face_thresholds.py labeled_face_pairs.json --output face_calibration.json
+
+Then enable the result in ``.env``::
+
+   FACE_MATCH_CALIBRATION_FILE=face_calibration.json
+
+Use a person-disjoint calibration/validation split and choose false-match and
+false-mismatch targets appropriate for the application. A cosine similarity is
+not a probability. InsightFace's supplied pretrained recognition models are
+restricted to non-commercial research use; review model licensing before
+commercial deployment.
 
 Awards
 ------

@@ -38,6 +38,27 @@ def _name_signal(identity, text):
         return 1.0
     if first and last and has_words(first) and has_words(last):
         return 0.9
+    # Accept only a very narrow spelling variation: the surname must match
+    # exactly and the first name may have one trailing character added or
+    # removed. This covers Apurv/Apurva without treating general fuzzy-name
+    # similarity as identity proof.
+    words = re.findall(r"[a-z0-9]+", text)
+    normalized_first = first.lower()
+    near_first = bool(
+        normalized_first
+        and len(normalized_first) >= 4
+        and any(
+            word != normalized_first
+            and abs(len(word) - len(normalized_first)) == 1
+            and (
+                word.startswith(normalized_first)
+                or normalized_first.startswith(word)
+            )
+            for word in words
+        )
+    )
+    if last and has_words(last) and near_first:
+        return 0.8
     if first and has_words(first):
         return 0.35
     if last and has_words(last):
@@ -73,6 +94,9 @@ def score_instagram_candidate(identity, candidate):
     linkedin_slug = _normalized(identity.get("public_id"))
     username = _normalized(candidate.get("username"))
     name_signal, name_evidence = _resolve_name(identity, candidate, text)
+    display_name_variant = bool(
+        _name_signal(identity, text) == 0.8
+    )
     exact_username_name = bool(full_name and username and full_name == username)
     direct_exact_name_handle = bool(candidate.get("direct_handle") and exact_username_name)
     exact_linkedin_slug = bool(linkedin_slug and username and linkedin_slug == username)
@@ -153,6 +177,8 @@ def score_instagram_candidate(identity, candidate):
     evidence = [key for key in ("name", "company", "school", "title", "location") if signals[key] > 0]
     if name_evidence:
         evidence.append(name_evidence)
+    if display_name_variant:
+        evidence.append("near_first_name_and_exact_last_name")
     if direct_exact_name_handle:
         evidence.append("direct_exact_full_name_handle")
     if exact_linkedin_slug:
@@ -173,12 +199,14 @@ def score_instagram_candidate(identity, candidate):
         evidence.append("found_in_{}_searches".format(candidate["search_hits"]))
     if candidate.get("school_context_hits", 0):
         evidence.append("school_in_public_instagram_context")
+    if candidate.get("company_context_hits", 0):
+        evidence.append("workplace_in_public_instagram_context")
     if candidate.get("location_context_hits", 0):
         evidence.append("location_in_public_instagram_context")
     evidence_families = []
     if signals["name"] >= 0.9:
         evidence_families.append("name")
-    if signals["company"] or signals["title"]:
+    if signals["company"] or signals["title"] or candidate.get("company_context_hits", 0) >= 2:
         evidence_families.append("employment")
     if signals["school"]:
         evidence_families.append("education")
@@ -193,6 +221,7 @@ def score_instagram_candidate(identity, candidate):
         "confidence": "high" if score >= 0.80 else "medium" if score >= 0.60 else "low",
         "evidence": evidence,
         "signals": signals,
+        "display_name_variant": display_name_variant,
         "search_hits": candidate.get("search_hits", 0),
         "matched_queries": candidate.get("matched_queries", []),
         "cross_platform_alias_hits": cross_platform_alias_hits,
@@ -204,6 +233,8 @@ def score_instagram_candidate(identity, candidate):
         "evidence_families": evidence_families,
         "negative_evidence": [],
         "school_context_hits": candidate.get("school_context_hits", 0),
+        "company_context_hits": candidate.get("company_context_hits", 0),
+        "observed_company_terms": candidate.get("observed_company_terms", []),
         "location_context_hits": candidate.get("location_context_hits", 0),
         "observed_location_terms": candidate.get("observed_location_terms", []),
         "post_context_urls": candidate.get("post_context_urls", []),

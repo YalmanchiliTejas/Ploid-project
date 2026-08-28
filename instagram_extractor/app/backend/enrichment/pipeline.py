@@ -4,11 +4,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
 
-from .avatar_cache import cache_profile_avatar
-from .face_matching import face_similarity
+from .avatar_cache import cache_profile_images
+from .face_matching import compare_face_images
 from .instagram_matching import score_instagram_candidate
 from .instagram_search import (
-    build_instagram_queries, extract_instagram_username, normalize_instagram_url,
+    build_instagram_queries, build_refined_instagram_queries,
+    extract_instagram_username, normalize_instagram_url,
     search_instagram_candidate_context,
     search_indexed_linkedin_profile, search_instagram_web, search_public_identity_context,
     search_public_social_aliases,
@@ -22,12 +23,11 @@ from .profile_avatar import fetch_profile_avatar
 
 MAX_CANDIDATES = 10
 CONTEXT_CANDIDATES = 3
+REFINEMENT_CANDIDATES = 5
 AVATAR_FETCH_WORKERS = 5
-FACE_MATCH_MIN_SIMILARITY = 0.45
 FACE_MATCH_MIN_MARGIN = 0.04
 FACE_SCORE_BONUS_BASE = 0.10
 FACE_SCORE_BONUS_MAX = 0.15
-FACE_MISMATCH_MAX_SIMILARITY = 0.05
 FACE_MISMATCH_PENALTY = 0.08
 
 
@@ -142,9 +142,11 @@ def _rank(identity, candidates):
     )
 
 
-def _add_public_candidate_context(identity, candidates, preliminary_ranked):
+def _add_public_candidate_context(identity, candidates, preliminary_ranked, limit=CONTEXT_CANDIDATES):
     """Supplement only the leading candidates with indexed post context."""
-    shortlisted = preliminary_ranked[:CONTEXT_CANDIDATES]
+    shortlisted = preliminary_ranked[:limit]
+    if not shortlisted:
+        return candidates
     with ThreadPoolExecutor(max_workers=max(1, len(shortlisted))) as executor:
         pending = {
             executor.submit(
@@ -160,13 +162,19 @@ def _add_public_candidate_context(identity, candidates, preliminary_ranked):
                 context = future.result() or {}
             except Exception:
                 continue
-            candidate.update({
-                key: context.get(key, [] if key.endswith(("urls", "terms", "queries")) else 0)
-                for key in (
-                    "school_context_hits", "location_context_hits",
-                    "observed_location_terms", "post_context_urls", "context_queries",
+            for key in (
+                "school_context_hits", "company_context_hits", "location_context_hits",
+            ):
+                candidate[key] = max(
+                    candidate.get(key, 0), context.get(key, 0)
                 )
-            })
+            for key in (
+                "observed_company_terms", "observed_location_terms",
+                "post_context_urls", "context_queries",
+            ):
+                candidate[key] = list(dict.fromkeys(
+                    (candidate.get(key) or []) + (context.get(key) or [])
+                ))
             for source_key, target_key in (("context_titles", "titles"), ("context_snippets", "snippets")):
                 for value in context.get(source_key, []):
                     if value and value not in candidate[target_key]:
@@ -174,60 +182,100 @@ def _add_public_candidate_context(identity, candidates, preliminary_ranked):
     return candidates
 
 
-def _add_avatar_urls(identity, ranked):
-    """Fetch known public avatar assets concurrently into the local cache."""
+def _add_avatar_urls(identity, ranked, refresh=False):
+    """Fetch profile and associated public image assets concurrently."""
     targets = []
-    if not identity.get("avatar_path"):
-        targets.append((identity, "linkedin", identity["public_id"], identity["linkedin_url"]))
-    targets.extend([
-        (candidate, "instagram", candidate["username"], candidate["url"])
-        for candidate in ranked if not candidate.get("avatar_path")
-    ])
+    if identity.get("avatar_path"):
+        identity["avatar_paths"] = [identity["avatar_path"]]
+    else:
+        targets.append((
+            identity, "linkedin", identity["public_id"],
+            identity["linkedin_url"], [],
+        ))
+    for candidate in ranked:
+        if candidate.get("avatar_paths") and not refresh:
+            continue
+        targets.append((
+            candidate, "instagram", candidate["username"], candidate["url"],
+            candidate.get("post_context_urls") or [],
+        ))
     with ThreadPoolExecutor(max_workers=AVATAR_FETCH_WORKERS) as executor:
         pending = {
-            executor.submit(cache_profile_avatar, provider, identifier, url): output
-            for output, provider, identifier, url in targets
+            executor.submit(
+                cache_profile_images,
+                provider,
+                identifier,
+                url,
+                related_urls=related_urls,
+            ): output
+            for output, provider, identifier, url, related_urls in targets
         }
         for future in as_completed(pending):
             output = pending[future]
             try:
-                output["avatar_path"] = future.result()
+                paths = future.result()
             except Exception:
-                output["avatar_path"] = None
+                paths = []
+            # A newly fetched LinkedIn image is the authoritative reference.
+            # Candidate refreshes, on the other hand, should retain previous
+            # profile photos while adding images exposed by refined searches.
+            existing = [] if output is identity else (output.get("avatar_paths") or [])
+            combined = list(dict.fromkeys(existing + paths))
+            output["avatar_paths"] = combined
+            output["avatar_path"] = combined[0] if combined else None
+
+
+def _refine_uncertain_result(identity, candidates, ranked):
+    """Run a targeted evidence pass for ambiguous/inconclusive candidates."""
+    shortlist = ranked[:REFINEMENT_CANDIDATES]
+    queries = build_refined_instagram_queries(identity, shortlist)
+    _collect_candidates(queries, candidates)
+    text_ranked = _rank(identity, candidates.values())
+    _add_public_candidate_context(
+        identity, candidates, text_ranked, limit=REFINEMENT_CANDIDATES
+    )
+    text_ranked = _rank(identity, candidates.values())[:MAX_CANDIDATES]
+    # Context searches often expose post URLs with clearer or additional
+    # photos. Refresh the shortlist so face comparison can use those images.
+    _add_avatar_urls(identity, text_ranked, refresh=True)
+    return _rerank_with_faces(identity, text_ranked), queries
 
 
 def _rerank_with_faces(identity, ranked):
-    """Supplement text scores with bounded local face-match evidence."""
-    reference_path = identity.get("avatar_path")
+    """Supplement text scores with quality-aware, tri-state face evidence."""
+    reference_paths = identity.get("avatar_paths") or [identity.get("avatar_path")]
     for candidate in ranked:
         text_score = candidate["score"]
-        similarity = face_similarity(reference_path, candidate.get("avatar_path"))
+        comparison = compare_face_images(
+            reference_paths,
+            candidate.get("avatar_paths") or [candidate.get("avatar_path")],
+        )
+        similarity = comparison["similarity"]
         bonus = 0.0
         penalty = 0.0
-        if similarity is not None and similarity >= FACE_MATCH_MIN_SIMILARITY:
+        if comparison["outcome"] == "match":
             progress = min(
-                (similarity - FACE_MATCH_MIN_SIMILARITY)
-                / (1.0 - FACE_MATCH_MIN_SIMILARITY),
+                (similarity - comparison["match_threshold"])
+                / max(1.0 - comparison["match_threshold"], 1e-6),
                 1.0,
             )
             bonus = FACE_SCORE_BONUS_BASE + (
                 FACE_SCORE_BONUS_MAX - FACE_SCORE_BONUS_BASE
             ) * progress
-        elif similarity is not None and similarity <= FACE_MISMATCH_MAX_SIMILARITY:
-            # InsightFace returned usable embeddings for both portraits, but
-            # they strongly disagree. Keep the penalty bounded because an
-            # Instagram avatar can still be a group or non-current portrait.
+        elif comparison["outcome"] == "mismatch":
             penalty = FACE_MISMATCH_PENALTY
         candidate["text_score"] = text_score
         candidate["face_similarity"] = similarity
+        candidate["face_outcome"] = comparison["outcome"]
         candidate["face_match_available"] = similarity is not None
+        candidate["face_comparison"] = comparison
         candidate["face_score_bonus"] = round(bonus, 3)
         candidate["face_score_penalty"] = round(penalty, 3)
         candidate["score"] = round(max(min(text_score + bonus - penalty, 1.0), 0.0), 3)
-        if bonus:
+        if comparison["outcome"] == "match":
             candidate.setdefault("evidence_families", []).append("face")
             candidate.setdefault("evidence", []).append("face_similarity_match")
-        if penalty:
+        if comparison["outcome"] == "mismatch":
             candidate.setdefault("negative_evidence", []).append("face_similarity_mismatch")
         candidate["confidence"] = (
             "high" if candidate["score"] >= 0.80
@@ -315,8 +363,7 @@ def find_instagram_from_linkedin(linkedin_url, fallback=False):
         return result
     best, second = ranked[0], ranked[1] if len(ranked) > 1 else None
     face_verified = (
-        best.get("face_similarity") is not None
-        and best["face_similarity"] >= FACE_MATCH_MIN_SIMILARITY
+        best.get("face_outcome") == "match"
         and best.get("text_score", 0.0) >= 0.35
         and (second is None or second.get("face_similarity") is None
              or best["face_similarity"] - second["face_similarity"] >= FACE_MATCH_MIN_MARGIN)
@@ -328,6 +375,38 @@ def find_instagram_from_linkedin(linkedin_url, fallback=False):
         and verification["margin_threshold_met"]
         and verification["independent_evidence_gate_met"]
     )
+    refinement_queries = []
+    refinement_attempted = False
+    if not (face_verified or text_verified) or best.get("face_outcome") == "inconclusive":
+        refinement_attempted = True
+        ranked, refinement_queries = _refine_uncertain_result(
+            identity, candidates, ranked
+        )
+        result["candidates"] = ranked
+        result["stats"]["candidates_returned"] = len(ranked)
+        best, second = ranked[0], ranked[1] if len(ranked) > 1 else None
+        face_verified = (
+            best.get("face_outcome") == "match"
+            and best.get("text_score", 0.0) >= 0.35
+            and (second is None or second.get("face_similarity") is None
+                 or best["face_similarity"] - second["face_similarity"] >= FACE_MATCH_MIN_MARGIN)
+        )
+        verification = _verification_summary(best, second)
+        face_verified = face_verified and "name" in verification["evidence_families"]
+        text_verified = (
+            verification["score_threshold_met"]
+            and verification["margin_threshold_met"]
+            and verification["independent_evidence_gate_met"]
+        )
+    result["stats"].update({
+        "refinement_attempted": refinement_attempted,
+        "refinement_queries_run": len(refinement_queries),
+        "refinement_candidates_checked": min(REFINEMENT_CANDIDATES, len(ranked)),
+    })
+    result["refinement"] = {
+        "attempted": refinement_attempted,
+        "queries": refinement_queries,
+    }
     result["verification"] = dict(
         verification,
         face_verification_met=face_verified,

@@ -24,16 +24,16 @@ def _safe_identifier(value):
     return normalized[:120] or "unknown"
 
 
-def cache_profile_avatar(provider, identifier, profile_url, cache_dir=None):
-    """Fetch a profile avatar and write it locally, returning its local path."""
+def _cache_profile_image(provider, identifier, profile_url, suffix="", cache_dir=None):
+    """Fetch one advertised image and write it locally."""
     asset = fetch_profile_avatar_asset(profile_url)
     if not asset:
         return None
     content_type = asset["content_type"].split(";", 1)[0].lower()
     extension = _EXTENSIONS.get(content_type, "img")
     root = _cache_root(cache_dir)
-    destination = root / _safe_identifier(provider) / "{}.{}".format(
-        _safe_identifier(identifier), extension
+    destination = root / _safe_identifier(provider) / "{}{}.{}".format(
+        _safe_identifier(identifier), suffix, extension
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(asset["content"])
@@ -41,6 +41,28 @@ def cache_profile_avatar(provider, identifier, profile_url, cache_dir=None):
         return str(destination.relative_to(Path.cwd()))
     except ValueError:
         return str(destination)
+
+
+def cache_profile_avatar(provider, identifier, profile_url, cache_dir=None):
+    """Fetch a profile avatar and write it locally, returning its local path."""
+    return _cache_profile_image(provider, identifier, profile_url, cache_dir=cache_dir)
+
+
+def cache_profile_images(provider, identifier, profile_url, related_urls=None,
+                         max_images=4, cache_dir=None):
+    """Cache a profile image plus a bounded set of associated public images."""
+    urls = list(dict.fromkeys(
+        url for url in [profile_url] + list(related_urls or []) if url
+    ))[:max_images]
+    paths = []
+    for index, url in enumerate(urls):
+        suffix = "" if index == 0 else "_{}".format(index)
+        path = _cache_profile_image(
+            provider, identifier, url, suffix=suffix, cache_dir=cache_dir
+        )
+        if path:
+            paths.append(path)
+    return paths
 
 
 def read_cached_avatar(path):

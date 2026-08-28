@@ -8,7 +8,6 @@ Subpackages
    :maxdepth: 4
 
    app.backend.scraping.google_search
-   app.backend.scraping.instagram
    app.backend.scraping.linkedin
    app.backend.scraping.scraper
    app.backend.scraping.twitter

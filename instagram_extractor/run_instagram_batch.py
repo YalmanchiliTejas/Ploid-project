@@ -32,9 +32,12 @@ def _record(linkedin_url, fallback):
             "face_score_bonus": instagram.get("face_score_bonus"),
             "face_score_penalty": instagram.get("face_score_penalty"),
             "face_similarity": instagram.get("face_similarity"),
+            "face_outcome": instagram.get("face_outcome", "inconclusive"),
             "face_match_available": instagram.get("face_match_available", False),
+            "face_comparison": instagram.get("face_comparison", {}),
             "confidence": instagram.get("confidence"),
             "verification": result.get("verification", {}),
+            "refinement": result.get("refinement", {}),
             # Keep confirmed matches distinct, while making a discovered but
             # ambiguous leading candidate visible at the top level.
             "potential_instagram_url": leading_candidate.get("url"),
@@ -59,10 +62,13 @@ def _record(linkedin_url, fallback):
                     "face_score_bonus": candidate.get("face_score_bonus"),
                     "face_score_penalty": candidate.get("face_score_penalty"),
                     "face_similarity": candidate.get("face_similarity"),
+                    "face_outcome": candidate.get("face_outcome", "inconclusive"),
                     "face_match_available": candidate.get("face_match_available", False),
+                    "face_comparison": candidate.get("face_comparison", {}),
                     "confidence": candidate.get("confidence"),
                     "evidence": candidate.get("evidence", []),
                     "signals": candidate.get("signals", {}),
+                    "display_name_variant": candidate.get("display_name_variant", False),
                     "search_hits": candidate.get("search_hits", 0),
                     "matched_queries": candidate.get("matched_queries", []),
                     "evidence_families": candidate.get("evidence_families", []),
@@ -74,6 +80,8 @@ def _record(linkedin_url, fallback):
                     ),
                     "alias_sources": candidate.get("alias_sources", []),
                     "school_context_hits": candidate.get("school_context_hits", 0),
+                    "company_context_hits": candidate.get("company_context_hits", 0),
+                    "observed_company_terms": candidate.get("observed_company_terms", []),
                     "location_context_hits": candidate.get("location_context_hits", 0),
                     "observed_location_terms": candidate.get("observed_location_terms", []),
                     "post_context_urls": candidate.get("post_context_urls", []),
@@ -111,6 +119,25 @@ def _existing_records(path):
     }
 
 
+def _retry_result(existing, attempted):
+    """Keep usable saved evidence when a live retry fails transiently."""
+    existing_name = ((existing or {}).get("linkedin_extracted") or {}).get("name", "")
+    invalid_existing_name = existing_name.strip().lower() in {
+        "about", "activity", "education", "experience", "sign in", "linkedin",
+    }
+    if (
+        attempted.get("status") == "error"
+        and existing
+        and existing.get("status") != "error"
+        and not invalid_existing_name
+    ):
+        retained = dict(existing)
+        retained["last_retry_error_type"] = attempted.get("error_type")
+        retained["last_retry_error"] = attempted.get("error")
+        return retained
+    return attempted
+
+
 def main():
     parser = argparse.ArgumentParser(description="Resolve a file of LinkedIn URLs to Instagram URLs.")
     parser.add_argument("input", nargs="?", default="linkedin_urls.txt", help="one LinkedIn URL per line")
@@ -130,7 +157,7 @@ def main():
     )
     parser.add_argument(
         "--retry-ambiguous", action="store_true",
-        help="reprocess ambiguous records while retaining matched records",
+        help="reprocess ambiguous/inconclusive records and inconclusive face matches",
     )
     args = parser.parse_args()
     load_dotenv()
@@ -142,32 +169,47 @@ def main():
         if (
             url not in records
             or records[url].get("status") == "error"
-            or (args.retry_ambiguous and records[url].get("status") == "ambiguous")
+            or (
+                args.retry_ambiguous
+                and (
+                    records[url].get("status") in {"ambiguous", "inconclusive"}
+                    or records[url].get("face_outcome") == "inconclusive"
+                )
+            )
         )
     ]
     if records:
         print("Resuming with {} previously saved profile(s).".format(len(records)))
     workers = max(1, min(args.workers, len(pending_urls) or 1))
+    completed_count = len(urls) - len(pending_urls)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         pending = {
             executor.submit(_record, url, args.fallback): url for url in pending_urls
         }
         for future in as_completed(pending):
             url = pending[future]
-            records[url] = future.result()
+            completed_count += 1
+            attempted = future.result()
+            records[url] = _retry_result(records.get(url), attempted)
             _write_output(args.output, urls, records)
             record = records[url]
             identity = record.get("linkedin_extracted") or {}
             displayed_match = record.get("instagram_url")
             if not displayed_match and record.get("potential_instagram_url"):
                 displayed_match = "potential: {}".format(record["potential_instagram_url"])
+            status = record.get("status")
+            if attempted.get("status") == "error" and record is not attempted:
+                status = "retry failed; retained {}".format(status)
             print(
-                "[{}/{}] {} | {} | {}".format(
-                    len([item for item in urls if item in records]),
+                "[{}/{}] {} | {} | {} | workplace: {} | location: {} | source: {}".format(
+                    completed_count,
                     len(urls),
                     identity.get("name") or url,
-                    record.get("status"),
+                    status,
                     displayed_match or "no Instagram candidate found",
+                    identity.get("current_company") or "not found",
+                    identity.get("location") or "not found",
+                    identity.get("source") or "not found",
                 ),
                 flush=True,
             )

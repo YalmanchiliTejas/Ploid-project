@@ -457,14 +457,6 @@
             "markers": "python_full_version >= '3.5.0'",
             "version": "==3.3"
         },
-        "instagram-private-api": {
-            "hashes": [
-                "sha256:5f9403fbd359764b2d070fa8ac22bc4546ec5a53c45676bcddafa66dc74d2f07",
-                "sha256:dfe0c2cb5aa881b98b2e428c3b02fa664a52af3f2d2354c19c4a8967cedf5d8e"
-            ],
-            "index": "pypi",
-            "version": "==1.6.0"
-        },
         "linkedin-api": {
             "hashes": [
                 "sha256:3bcc8d1dc174df00016ba34d49b4e70a9c9d7090f1192a342925c1f137b0596f",

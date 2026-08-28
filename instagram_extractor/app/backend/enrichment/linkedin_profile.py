@@ -5,13 +5,23 @@ import json
 import os
 from pathlib import Path
 import re
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+
+
+def normalize_linkedin_url(linkedin_url):
+    """Return an absolute HTTPS URL suitable for browser navigation."""
+    value = (linkedin_url or "").strip()
+    if value.lower().startswith("http://"):
+        return "https://" + value[len("http://"):]
+    if not value.lower().startswith("https://"):
+        return "https://" + value
+    return value
 
 
 def extract_public_id(linkedin_url):
     """Return the public id from a linkedin.com/in/<public-id> URL."""
-    value = (linkedin_url or "").strip()
-    parsed = urlparse(value if "://" in value else "https://" + value)
+    value = normalize_linkedin_url(linkedin_url)
+    parsed = urlparse(value)
     host = parsed.hostname.lower() if parsed.hostname else ""
     parts = [part for part in parsed.path.split("/") if part]
     if (host != "linkedin.com" and not host.endswith(".linkedin.com")) or len(parts) != 2:
@@ -130,6 +140,20 @@ def _text(value):
     return value.strip() if isinstance(value, str) else ""
 
 
+_INVALID_PROFILE_NAMES = {
+    "about", "activity", "contact info", "education", "experience",
+    "honors & awards", "interests", "join linkedin", "languages",
+    "licenses & certifications", "linkedin", "people also viewed",
+    "projects", "recommendations", "sign in", "skills", "volunteering",
+}
+
+
+def _is_invalid_profile_name(value):
+    """Reject navigation and section labels accidentally read as a name."""
+    normalized = re.sub(r"\s+", " ", _text(value)).strip().lower()
+    return not normalized or normalized in _INVALID_PROFILE_NAMES
+
+
 def _experience_values(profile):
     companies, titles = [], []
     for item in profile.get("experience") or []:
@@ -211,11 +235,16 @@ def _normalize_scraped_profile(profile, linkedin_url, public_id):
         "titles": titles,
         "identity_source": "linkedin_scraper",
         "avatar_path": profile.get("avatar_path"),
+        # Keep the visible DOM evidence so a single-profile run can show
+        # exactly which LinkedIn page components supplied the identity.
+        "page_components": profile.get("page_components") or {},
+        "experiences": experiences,
+        "educations": education,
     }
 
 
 async def _cache_linkedin_avatar_from_page(page, public_id):
-    """Save the authenticated profile portrait for local face comparison."""
+    """Download the largest authenticated portrait, falling back to a screenshot."""
     images = page.locator(
         'main img[src*="profile-displayphoto"], '
         'main img[src*="profile-framedphoto"]'
@@ -230,15 +259,209 @@ async def _cache_linkedin_avatar_from_page(page, public_id):
             / "{}.png".format(re.sub(r"[^a-zA-Z0-9_.-]+", "_", public_id))
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
+        attributes = await image.evaluate("""element => ({
+            src: element.getAttribute('src') || '',
+            currentSrc: element.currentSrc || '',
+            srcset: element.getAttribute('srcset') || ''
+        })""")
+        source_url = _largest_srcset_url(
+            attributes.get("srcset", ""),
+            attributes.get("currentSrc") or attributes.get("src", ""),
+            page.url,
+        )
+        if source_url:
+            try:
+                response = await page.context.request.get(
+                    source_url,
+                    headers={"Referer": page.url},
+                    timeout=30000,
+                )
+                content_type = response.headers.get("content-type", "").split(";", 1)[0]
+                content = await response.body()
+                if response.ok and content_type.startswith("image/") and content:
+                    extension = {
+                        "image/jpeg": "jpg", "image/png": "png",
+                        "image/webp": "webp", "image/avif": "avif",
+                    }.get(content_type, "img")
+                    destination = destination.with_suffix("." + extension)
+                    destination.write_bytes(content)
+                    return _relative_path(destination)
+            except Exception:
+                # The authenticated CDN URL can expire between DOM extraction
+                # and download. Retain the rendered-image fallback below.
+                pass
         try:
             await image.screenshot(path=str(destination))
         except Exception:
             continue
-        try:
-            return str(destination.relative_to(Path.cwd()))
-        except ValueError:
-            return str(destination)
+        return _relative_path(destination)
     return None
+
+
+def _relative_path(path):
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
+
+
+def _largest_srcset_url(srcset, fallback, page_url):
+    """Select the largest advertised image candidate from an HTML srcset."""
+    candidates = []
+    for position, item in enumerate((srcset or "").split(",")):
+        parts = item.strip().rsplit(None, 1)
+        if not parts:
+            continue
+        descriptor = parts[1].lower() if len(parts) == 2 else ""
+        try:
+            size = float(descriptor[:-1]) if descriptor.endswith(("w", "x")) else 0.0
+        except ValueError:
+            size = 0.0
+        candidates.append((size, -position, parts[0]))
+    selected = max(candidates)[2] if candidates else fallback
+    return urljoin(page_url, selected) if selected else None
+
+
+async def _first_visible_text(locator):
+    for index in range(await locator.count()):
+        element = locator.nth(index)
+        try:
+            if await element.is_visible():
+                value = _text(await element.inner_text())
+                if value:
+                    return value
+        except Exception:
+            continue
+    return ""
+
+
+async def _first_visible_component(root, selectors):
+    """Return the selector and text for the first visible DOM match."""
+    for selector in selectors:
+        locator = root.locator(selector)
+        for index in range(await locator.count()):
+            element = locator.nth(index)
+            try:
+                if not await element.is_visible():
+                    continue
+                value = _text(await element.inner_text())
+            except Exception:
+                continue
+            if value:
+                return {"selector": selector, "text": value}
+    return {"selector": "", "text": ""}
+
+
+def _clean_component_lines(value):
+    """Compact repeated accessibility text without inventing field values."""
+    output = []
+    for line in (value or "").splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if line and (not output or output[-1] != line):
+            output.append(line)
+    return output
+
+
+async def _profile_section_component(section, section_name, section_index, heading, matched_by):
+    """Capture visible list items from one Experience or Education section."""
+    entries = []
+    items = section.locator("li")
+    for index in range(min(await items.count(), 20)):
+        item = items.nth(index)
+        try:
+            if not await item.is_visible():
+                continue
+            lines = _clean_component_lines(await item.inner_text())
+        except Exception:
+            continue
+        if not lines:
+            continue
+        joined = " ".join(lines).lower()
+        if joined.startswith("show all ") or joined in {"experience", "education"}:
+            continue
+        # Nested LinkedIn list elements can expose the same text more than
+        # once. Retain a stable, readable set for inspection.
+        if lines not in entries:
+            entries.append(lines[:12])
+        if len(entries) >= 10:
+            break
+    return {
+        "heading": section_name,
+        "visible_heading": heading,
+        "selector": "main section:nth-of-type({})".format(section_index + 1),
+        "matched_by": matched_by,
+        "entries": entries,
+        "raw_lines": _clean_component_lines(await section.inner_text())[:60],
+    }
+
+
+async def _visible_profile_sections(main):
+    components = {"experience": [], "education": [], "sections_seen": []}
+    sections = main.locator("section")
+    for index in range(await sections.count()):
+        section = sections.nth(index)
+        try:
+            if not await section.is_visible():
+                continue
+            lines = _clean_component_lines(await section.inner_text())
+        except Exception:
+            continue
+        heading_component = await _first_visible_component(
+            section, ("h2", "h3", '[role="heading"]')
+        )
+        heading = heading_component["text"] or (lines[0] if lines else "")
+        try:
+            element_ids = await section.locator("[id]").evaluate_all(
+                "elements => elements.map(element => element.id).filter(Boolean)"
+            )
+        except Exception:
+            element_ids = []
+        normalized_ids = {value.strip().lower() for value in element_ids}
+        components["sections_seen"].append({
+            "index": index + 1,
+            "heading": heading,
+            "heading_selector": heading_component["selector"],
+            "element_ids": element_ids[:10],
+            "visible_line_count": len(lines),
+            "preview": lines[:8],
+        })
+        for section_name in components:
+            if section_name == "sections_seen":
+                continue
+            heading_match = heading.strip().lower() == section_name
+            id_match = section_name in normalized_ids
+            if heading_match or id_match:
+                components[section_name].append(
+                    await _profile_section_component(
+                        section,
+                        section_name.title(),
+                        index,
+                        heading,
+                        "heading" if heading_match else "element id",
+                    )
+                )
+                break
+    return components
+
+
+async def _load_lazy_profile_sections(page):
+    """Scroll through the profile so LinkedIn renders below-fold sections."""
+    positions = []
+    for fraction in (0.20, 0.40, 0.60, 0.80, 1.0):
+        position = await page.evaluate(
+            "fraction => {"
+            " const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
+            " const y = Math.floor(height * fraction);"
+            " window.scrollTo(0, y);"
+            " return {fraction, y, height};"
+            "}",
+            fraction,
+        )
+        positions.append(position)
+        await page.wait_for_timeout(400)
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(250)
+    return positions
 
 
 async def _augment_from_current_profile_dom(page, profile):
@@ -248,13 +471,33 @@ async def _augment_from_current_profile_dom(page, profile):
     if not await main.count():
         return profile
 
-    headings = main.locator("h2")
-    name = ""
-    for index in range(await headings.count()):
-        candidate = _text(await headings.nth(index).inner_text())
-        if candidate and "notification" not in candidate.lower():
-            name = candidate
-            break
+    # Current LinkedIn desktop pages expose the profile name as an h1 or with
+    # text-heading-xlarge. h2 is a last-resort fallback because most section
+    # labels (About, Experience, Education) are h2 elements too.
+    name_component = await _first_visible_component(main, (
+        "h1",
+        ".text-heading-xlarge",
+        '[data-anonymize="person-name"]',
+        "h2",
+    ))
+    name = name_component["text"]
+    if _is_invalid_profile_name(name):
+        # A generic h2 may be a section label. Search every candidate while
+        # retaining the selector that ultimately supplied the valid name.
+        name = ""
+        for selector in ("h1", ".text-heading-xlarge", '[data-anonymize="person-name"]', "h2"):
+            candidates = main.locator(selector)
+            for index in range(await candidates.count()):
+                try:
+                    candidate = _text(await candidates.nth(index).inner_text())
+                except Exception:
+                    continue
+                if not _is_invalid_profile_name(candidate):
+                    name = candidate
+                    name_component = {"selector": selector, "text": candidate}
+                    break
+            if name:
+                break
 
     sections = main.locator("section")
     top_lines, about = [], ""
@@ -270,9 +513,24 @@ async def _augment_from_current_profile_dom(page, profile):
 
     if name and _text(profile.get("name")).lower() in {"", "unknown"}:
         profile["name"] = name
-    if len(top_lines) >= 3:
-        profile["headline"] = _text(profile.get("headline")) or top_lines[1]
-        profile["location"] = _text(profile.get("location")) or top_lines[2]
+    headline_component = await _first_visible_component(main, (
+        ".text-body-medium.break-words",
+        '[data-anonymize="headline"]',
+    ))
+    location_component = await _first_visible_component(main, (
+        ".text-body-small.inline.t-black--light.break-words",
+        '[data-anonymize="location"]',
+    ))
+    headline = headline_component["text"]
+    location = location_component["text"]
+    if not headline and len(top_lines) >= 2:
+        headline = top_lines[1]
+        headline_component = {"selector": "top profile section line 2", "text": headline}
+    if not location and len(top_lines) >= 3:
+        location = top_lines[2]
+        location_component = {"selector": "top profile section line 3", "text": location}
+    profile["headline"] = _text(profile.get("headline")) or headline
+    profile["location"] = _text(profile.get("location")) or location
     if about and not _text(profile.get("about")):
         profile["about"] = about
 
@@ -292,7 +550,10 @@ async def _augment_from_current_profile_dom(page, profile):
     title = headline
     for separator in (" at ", " of ", " @ "):
         if separator in headline:
-            title = headline.split(separator, 1)[0].strip()
+            title, headline_company = (
+                part.strip() for part in headline.split(separator, 1)
+            )
+            company = company or headline_company
             break
     if company and not profile.get("experiences"):
         profile["experiences"] = [{
@@ -301,6 +562,16 @@ async def _augment_from_current_profile_dom(page, profile):
         }]
     if school and not profile.get("educations"):
         profile["educations"] = [{"institution_name": school}]
+
+    section_components = await _visible_profile_sections(main)
+    profile["page_components"] = {
+        "name": name_component,
+        "headline": headline_component,
+        "location": location_component,
+        "experience": section_components["experience"],
+        "education": section_components["education"],
+        "sections_seen": section_components["sections_seen"],
+    }
     return profile
 
 
@@ -359,11 +630,27 @@ async def _scrape_linkedin_profile(linkedin_url, session_file, headless):
         await scraper.check_rate_limit()
         await browser.page.locator("main").wait_for(state="visible", timeout=10000)
         await browser.page.wait_for_timeout(1500)
+        scroll_positions = await _load_lazy_profile_sections(browser.page)
         current_profile = await _augment_from_current_profile_dom(browser.page, {
             "experiences": [],
             "educations": [],
         })
-        if _text(current_profile.get("name")):
+        current_profile.setdefault("page_components", {})["lazy_load_scroll"] = (
+            scroll_positions
+        )
+        current_name = _text(current_profile.get("name"))
+        current_url = browser.page.url.lower()
+        if (
+            _is_invalid_profile_name(current_name)
+            or "/login" in current_url
+            or "/uas/login" in current_url
+        ):
+            raise RuntimeError(
+                "LinkedIn did not expose a valid profile top card (received {!r}). "
+                "Refresh the session with `python create_linkedin_session.py` if needed."
+                .format(current_name)
+            )
+        if current_name:
             current_profile["avatar_path"] = await _cache_linkedin_avatar_from_page(
                 browser.page, extract_public_id(linkedin_url)
             )
@@ -377,6 +664,7 @@ async def _scrape_linkedin_profile(linkedin_url, session_file, headless):
 
 def fetch_linkedin_profile(linkedin_url):
     """Fetch one profile through joeyism/linkedin_scraper's Playwright client."""
+    linkedin_url = normalize_linkedin_url(linkedin_url)
     public_id = extract_public_id(linkedin_url)
     session_file = os.getenv("LINKEDIN_SESSION_FILE", "linkedin_session.json")
     # Profile lookups must never create a visible browser window unless the

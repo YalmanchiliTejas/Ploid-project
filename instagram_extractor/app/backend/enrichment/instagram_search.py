@@ -76,6 +76,60 @@ def build_instagram_queries(identity):
     return list(dict.fromkeys(queries))
 
 
+def build_refined_instagram_queries(identity, candidates):
+    """Build a focused second pass for an unresolved candidate set.
+
+    Unlike the broad discovery queries, these combine the person's workplace
+    and location and bind each query to an already-observed handle. This keeps
+    common names from introducing a large number of unrelated profiles.
+    """
+    name = (identity.get("name") or "").strip()
+    company = (identity.get("current_company") or "").strip()
+    location = (identity.get("location") or "").strip()
+    first_name = (identity.get("first_name") or "").strip()
+    last_name = (identity.get("last_name") or "").strip()
+    city = location.split(",", 1)[0].strip() if location else ""
+    places = list(dict.fromkeys(place for place in (location, city) if place))
+    queries = []
+    if name and company and location:
+        queries.append(
+            "site:instagram.com {} {} {}".format(
+                _quoted(name), _quoted(company), _quoted(location)
+            )
+        )
+    for candidate in candidates:
+        username = (candidate.get("username") or "").strip().lstrip("@")
+        if not username:
+            continue
+        # Always resolve the exact handle during refinement. Its indexed title
+        # can reveal a display-name spelling variant such as Apurv/Apurva even
+        # when workplace and location were unavailable from LinkedIn.
+        queries.append("site:instagram.com {}".format(_quoted(username)))
+        if first_name:
+            queries.append(
+                'site:instagram.com "@{}" {}'.format(username, _quoted(first_name))
+            )
+        if last_name:
+            queries.append(
+                'site:instagram.com "@{}" {}'.format(username, _quoted(last_name))
+            )
+        if company:
+            queries.append(
+                'site:instagram.com "@{}" {}'.format(username, _quoted(company))
+            )
+        for place in places:
+            queries.append(
+                'site:instagram.com "@{}" {}'.format(username, _quoted(place))
+            )
+        if company and city:
+            queries.append(
+                'site:instagram.com "@{}" {} {}'.format(
+                    username, _quoted(company), _quoted(city)
+                )
+            )
+    return list(dict.fromkeys(queries))
+
+
 def _search_web(query):
     """Return normalized public web-search results without requiring an API key."""
     from ddgs import DDGS
@@ -115,7 +169,7 @@ def _mentions(value, term):
 
 
 def search_instagram_candidate_context(identity, username):
-    """Find indexed school and location evidence for one shortlisted account.
+    """Find indexed school, workplace, and location evidence for an account.
 
     Search results can expose profile biographies, captions, and visible post
     location labels. They cannot prove that the candidate follows a school
@@ -138,10 +192,20 @@ def search_instagram_candidate_context(identity, username):
         city = location.split(",", 1)[0].strip()
         if len(city) >= 3 and city.lower() != location.lower():
             locations.append(city)
+    companies = list(dict.fromkeys(
+        company.strip() for company in (
+            identity.get("companies") or [identity.get("current_company")]
+        )
+        if isinstance(company, str) and company.strip()
+    ))[:2]
     specifications = [
         ("school", school,
          'site:instagram.com "@{}" {}'.format(username, _quoted(school)))
         for school in schools
+    ] + [
+        ("company", company,
+         'site:instagram.com "@{}" {}'.format(username, _quoted(company)))
+        for company in companies
     ] + [
         ("location", place,
          'site:instagram.com "@{}" {}'.format(username, _quoted(place)))
@@ -149,7 +213,9 @@ def search_instagram_candidate_context(identity, username):
     ]
     output = {
         "school_context_hits": 0,
+        "company_context_hits": 0,
         "location_context_hits": 0,
+        "observed_company_terms": [],
         "observed_location_terms": [],
         "post_context_urls": [],
         "context_titles": [],
@@ -185,6 +251,8 @@ def search_instagram_candidate_context(identity, username):
                 continue
             seen.add(key)
             output[kind + "_context_hits"] += 1
+            if kind == "company" and term not in output["observed_company_terms"]:
+                output["observed_company_terms"].append(term)
             if kind == "location" and term not in output["observed_location_terms"]:
                 output["observed_location_terms"].append(term)
             if is_post and link not in output["post_context_urls"]:

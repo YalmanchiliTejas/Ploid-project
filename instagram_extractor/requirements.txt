@@ -5,6 +5,12 @@ ddgs
 linkedin-scraper
 python-dotenv
 # Optional local LinkedIn-avatar to Instagram-avatar reranking.
+numpy>=1.24,<2
+scipy>=1.10,<1.12
+scikit-image>=0.20,<0.23
 insightface
+onnx>=1.14,<1.18
 onnxruntime
-opencv-python-headless
+opencv-python<4.12
+opencv-python-headless<4.12
+protobuf>=4.25.8,<6

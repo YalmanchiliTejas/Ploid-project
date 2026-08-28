@@ -5,13 +5,15 @@ from unittest.mock import patch
 
 from app.backend.enrichment.instagram_matching import score_instagram_candidate
 from app.backend.enrichment.instagram_search import (
-    build_instagram_queries, extract_instagram_username, normalize_instagram_url,
+    build_instagram_queries, build_refined_instagram_queries,
+    extract_instagram_username, normalize_instagram_url,
     search_instagram_candidate_context, search_public_social_aliases,
 )
-from app.backend.enrichment.profile_avatar import extract_og_image
+from app.backend.enrichment.profile_avatar import extract_advertised_images, extract_og_image
 from app.backend.enrichment.linkedin_profile import (
     enrich_identity_from_public_context, extract_public_id, fallback_identity_from_url,
-    identity_from_indexed_linkedin_results, _normalize_scraped_profile,
+    identity_from_indexed_linkedin_results, normalize_linkedin_url, _largest_srcset_url,
+    _is_invalid_profile_name, _normalize_scraped_profile,
 )
 from app.backend.enrichment.pipeline import (
     _direct_handle_candidates, _rerank_with_faces, _verification_summary,
@@ -27,6 +29,15 @@ IDENTITY = {
     "current_title": "Software Engineer", "companies": ["Google"],
     "schools": ["Purdue University"], "titles": ["Software Engineer"],
 }
+
+
+def _face_result(outcome="inconclusive", similarity=None):
+    return {
+        "outcome": outcome,
+        "similarity": similarity,
+        "match_threshold": 0.45,
+        "mismatch_threshold": 0.05,
+    }
 
 
 class TestInstagramEnrichment(unittest.TestCase):
@@ -52,6 +63,20 @@ class TestInstagramEnrichment(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             extract_public_id("https://www.linkedin.com/company/google/")
+
+    def test_normalizes_linkedin_urls_for_browser_navigation(self):
+        self.assertEqual(
+            normalize_linkedin_url("www.linkedin.com/in/apurv-andhale"),
+            "https://www.linkedin.com/in/apurv-andhale",
+        )
+        self.assertEqual(
+            normalize_linkedin_url("http://www.linkedin.com/in/apurv-andhale"),
+            "https://www.linkedin.com/in/apurv-andhale",
+        )
+        self.assertEqual(
+            normalize_linkedin_url("https://www.linkedin.com/in/apurv-andhale"),
+            "https://www.linkedin.com/in/apurv-andhale",
+        )
 
     def test_fallback_identity_uses_only_the_public_url(self):
         identity = fallback_identity_from_url("https://www.linkedin.com/in/john-smith-123/")
@@ -84,11 +109,14 @@ class TestInstagramEnrichment(unittest.TestCase):
             "about": "Building useful products.",
             "experiences": [{"position_title": "Engineer", "institution_name": "Google"}],
             "educations": [{"institution_name": "Purdue University"}],
+            "page_components": {"name": {"selector": "h1", "text": "John Smith"}},
         }, IDENTITY["linkedin_url"], "john-smith-123")
         self.assertEqual(identity["current_title"], "Engineer")
         self.assertEqual(identity["current_company"], "Google")
         self.assertEqual(identity["schools"], ["Purdue University"])
         self.assertEqual(identity["identity_source"], "linkedin_scraper")
+        self.assertEqual(identity["page_components"]["name"]["selector"], "h1")
+        self.assertEqual(identity["experiences"][0]["institution_name"], "Google")
 
     def test_normalizes_only_instagram_profiles(self):
         self.assertEqual(
@@ -99,6 +127,11 @@ class TestInstagramEnrichment(unittest.TestCase):
         self.assertIsNone(normalize_instagram_url("https://instagram.com/p/post-id/"))
         self.assertIsNone(normalize_instagram_url("https://example.com/johnsmith"))
 
+    def test_rejects_linkedin_section_labels_as_profile_names(self):
+        for value in ("About", "Experience", "Education", "Sign in"):
+            self.assertTrue(_is_invalid_profile_name(value))
+        self.assertFalse(_is_invalid_profile_name("Apurv Andhale"))
+
     def test_extracts_absolute_or_relative_open_graph_images(self):
         self.assertEqual(
             extract_og_image(
@@ -108,6 +141,27 @@ class TestInstagramEnrichment(unittest.TestCase):
             "https://www.instagram.com/profile-photo.jpg",
         )
         self.assertIsNone(extract_og_image("<title>No avatar</title>", "https://example.com/"))
+
+    def test_prefers_largest_publicly_advertised_image(self):
+        images = extract_advertised_images("""
+            <meta property="og:image" content="/small.jpg">
+            <meta property="og:image:width" content="100">
+            <meta property="og:image:height" content="100">
+            <meta property="og:image" content="/large.jpg">
+            <meta property="og:image:width" content="800">
+            <meta property="og:image:height" content="800">
+        """, "https://www.instagram.com/example/")
+        self.assertEqual(images[0]["url"], "https://www.instagram.com/large.jpg")
+
+    def test_selects_largest_linkedin_srcset_image(self):
+        self.assertEqual(
+            _largest_srcset_url(
+                "/photo-100.jpg 100w, /photo-800.jpg 800w",
+                "/photo-200.jpg",
+                "https://www.linkedin.com/in/example/",
+            ),
+            "https://www.linkedin.com/photo-800.jpg",
+        )
 
     def test_builds_site_restricted_queries(self):
         queries = build_instagram_queries(IDENTITY)
@@ -123,6 +177,44 @@ class TestInstagramEnrichment(unittest.TestCase):
         queries = build_instagram_queries(identity)
         self.assertIn('site:instagram.com "John Smith"', queries)
         self.assertIn('site:instagram.com "John"', queries)
+
+    def test_refined_queries_bind_shortlist_to_workplace_and_location(self):
+        queries = build_refined_instagram_queries(
+            dict(IDENTITY, location="San Francisco, California"),
+            [{"username": "john_smith23"}],
+        )
+        self.assertIn(
+            'site:instagram.com "John Smith" "Google" "San Francisco, California"',
+            queries,
+        )
+        self.assertIn(
+            'site:instagram.com "@john_smith23" "Google" "San Francisco"',
+            queries,
+        )
+        self.assertIn('site:instagram.com "john_smith23"', queries)
+        self.assertIn('site:instagram.com "@john_smith23" "John"', queries)
+        self.assertIn('site:instagram.com "@john_smith23" "Smith"', queries)
+
+    def test_near_first_name_requires_an_exact_last_name(self):
+        candidate = {
+            "username": "apurvandhale",
+            "url": "https://www.instagram.com/apurvandhale/",
+            "search_hits": 1,
+            "titles": ["Apurva Andhale (@apurvandhale)"],
+            "snippets": [],
+        }
+        identity = dict(
+            IDENTITY,
+            name="Apurv Andhale", first_name="Apurv", last_name="Andhale",
+            public_id="apurv-andhale", identity_source="linkedin_scraper",
+        )
+        match = score_instagram_candidate(identity, candidate)
+        self.assertTrue(match["display_name_variant"])
+        self.assertIn("near_first_name_and_exact_last_name", match["evidence"])
+
+        candidate["titles"] = ["Apurva Mehra (@apurvandhale)"]
+        mismatch = score_instagram_candidate(identity, candidate)
+        self.assertFalse(mismatch["display_name_variant"])
 
     def test_name_is_required_for_a_high_score(self):
         candidate = {
@@ -228,7 +320,10 @@ class TestInstagramEnrichment(unittest.TestCase):
             ]
         )
 
-    @patch("app.backend.enrichment.pipeline.face_similarity", return_value=0.0)
+    @patch(
+        "app.backend.enrichment.pipeline.compare_face_images",
+        return_value=_face_result("mismatch", 0.0),
+    )
     def test_clear_face_mismatch_adds_bounded_negative_evidence(self, mock_face):
         ranked = [{
             "username": "johnsmith", "url": "https://www.instagram.com/johnsmith/",
@@ -237,6 +332,7 @@ class TestInstagramEnrichment(unittest.TestCase):
         }]
         result = _rerank_with_faces({"avatar_path": "linkedin.jpg"}, ranked)
         self.assertEqual(result[0]["score"], 0.62)
+        self.assertEqual(result[0]["face_outcome"], "mismatch")
         self.assertEqual(result[0]["face_score_penalty"], 0.08)
         self.assertIn("face_similarity_mismatch", result[0]["negative_evidence"])
 
@@ -292,7 +388,7 @@ class TestInstagramEnrichment(unittest.TestCase):
         mock_search.return_value = [{
             "link": "https://www.instagram.com/p/example-post/",
             "title": "John Smith (@johnasmith) on Instagram",
-            "snippet": "Back at Purdue University in San Francisco.",
+            "snippet": "Back at Purdue University in San Francisco after work at Google.",
         }]
         context = search_instagram_candidate_context(
             dict(IDENTITY, schools=["Purdue University"]),
@@ -300,6 +396,8 @@ class TestInstagramEnrichment(unittest.TestCase):
         )
         self.assertGreater(context["school_context_hits"], 0)
         self.assertGreater(context["location_context_hits"], 0)
+        self.assertGreater(context["company_context_hits"], 0)
+        self.assertEqual(context["observed_company_terms"], ["Google"])
         self.assertEqual(
             context["post_context_urls"],
             ["https://www.instagram.com/p/example-post/"],
@@ -331,8 +429,8 @@ class TestInstagramEnrichment(unittest.TestCase):
             aliases[0]["supporting_results"][0]["relationship"], "identity_profile"
         )
 
-    @patch("app.backend.enrichment.pipeline.face_similarity", return_value=None)
-    @patch("app.backend.enrichment.pipeline.cache_profile_avatar", return_value="avatar_cache/linkedin/john-smith.jpg")
+    @patch("app.backend.enrichment.pipeline.compare_face_images", return_value=_face_result())
+    @patch("app.backend.enrichment.pipeline.cache_profile_images", return_value=["avatar_cache/linkedin/john-smith.jpg"])
     @patch("app.backend.enrichment.pipeline.search_instagram_web")
     @patch("app.backend.enrichment.pipeline.fetch_linkedin_profile")
     def test_returns_ambiguous_candidates_when_scores_are_close(self, mock_profile, mock_search, mock_avatar, mock_face):
@@ -348,8 +446,11 @@ class TestInstagramEnrichment(unittest.TestCase):
         self.assertEqual(result["linkedin"]["avatar_path"], "avatar_cache/linkedin/john-smith.jpg")
         self.assertEqual(result["candidates"][0]["avatar_path"], "avatar_cache/linkedin/john-smith.jpg")
 
-    @patch("app.backend.enrichment.pipeline.face_similarity", side_effect=[0.31, 0.87])
-    @patch("app.backend.enrichment.pipeline.cache_profile_avatar", return_value="avatar_cache/profile.jpg")
+    @patch(
+        "app.backend.enrichment.pipeline.compare_face_images",
+        side_effect=[_face_result("inconclusive", 0.31), _face_result("match", 0.87)],
+    )
+    @patch("app.backend.enrichment.pipeline.cache_profile_images", return_value=["avatar_cache/profile.jpg"])
     @patch("app.backend.enrichment.pipeline.search_instagram_web")
     @patch("app.backend.enrichment.pipeline.fetch_linkedin_profile")
     def test_face_similarity_reranks_the_text_top_ten(self, mock_profile, mock_search, mock_avatar, mock_face):
@@ -368,8 +469,39 @@ class TestInstagramEnrichment(unittest.TestCase):
         )
         self.assertEqual(mock_face.call_count, 2)
 
-    @patch("app.backend.enrichment.pipeline.face_similarity", return_value=None)
-    @patch("app.backend.enrichment.pipeline.cache_profile_avatar", return_value=None)
+    @patch(
+        "app.backend.enrichment.pipeline.compare_face_images",
+        side_effect=[
+            _face_result("inconclusive", 0.30),
+            _face_result("inconclusive", 0.29),
+            _face_result("match", 0.88),
+            _face_result("inconclusive", 0.29),
+        ],
+    )
+    @patch("app.backend.enrichment.pipeline.cache_profile_images", return_value=["avatar_cache/profile.jpg"])
+    @patch("app.backend.enrichment.pipeline.search_instagram_web")
+    @patch("app.backend.enrichment.pipeline.fetch_linkedin_profile")
+    def test_refined_photo_pass_resolves_an_initially_ambiguous_result(
+        self, mock_profile, mock_search, mock_avatar, mock_face
+    ):
+        mock_profile.return_value = IDENTITY
+        mock_search.return_value = [
+            {"link": "https://instagram.com/johnsmith/", "title": "John Smith Google", "snippet": "San Francisco"},
+            {"link": "https://instagram.com/john_smith23/", "title": "John Smith Google", "snippet": "San Francisco"},
+        ]
+        result = find_instagram_from_linkedin(IDENTITY["linkedin_url"])
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["instagram"]["username"], "johnsmith")
+        self.assertTrue(result["stats"]["refinement_attempted"])
+        self.assertGreater(result["stats"]["refinement_queries_run"], 0)
+        self.assertTrue(any(
+            '"Google"' in query and '"San Francisco"' in query
+            for query in result["refinement"]["queries"]
+        ))
+        self.assertEqual(mock_face.call_count, 4)
+
+    @patch("app.backend.enrichment.pipeline.compare_face_images", return_value=_face_result())
+    @patch("app.backend.enrichment.pipeline.cache_profile_images", return_value=[])
     @patch("app.backend.enrichment.pipeline.search_instagram_web")
     @patch("app.backend.enrichment.pipeline.fetch_linkedin_profile")
     def test_returns_at_most_ten_ranked_candidates(self, mock_profile, mock_search, mock_avatar, mock_face):
@@ -386,8 +518,8 @@ class TestInstagramEnrichment(unittest.TestCase):
         self.assertEqual(result["stats"]["instagram_candidates_found"], 26)
         self.assertEqual(result["stats"]["candidates_returned"], 10)
 
-    @patch("app.backend.enrichment.pipeline.face_similarity", return_value=None)
-    @patch("app.backend.enrichment.pipeline.cache_profile_avatar", return_value=None)
+    @patch("app.backend.enrichment.pipeline.compare_face_images", return_value=_face_result())
+    @patch("app.backend.enrichment.pipeline.cache_profile_images", return_value=[])
     @patch("app.backend.enrichment.pipeline.search_instagram_web")
     @patch("app.backend.enrichment.pipeline.search_public_identity_context", return_value=[])
     @patch("app.backend.enrichment.pipeline.search_indexed_linkedin_profile")
