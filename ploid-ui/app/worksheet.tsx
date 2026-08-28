@@ -26,6 +26,8 @@ import {
   EnrichmentColumnSheet,
   type EnrichmentAction,
 } from "@/components/spreadsheet/EnrichmentColumnSheet";
+import { EnrichmentPickerDialog } from "@/components/spreadsheet/EnrichmentPickerDialog";
+import { EnrichmentDetailsSheet } from "@/components/spreadsheet/EnrichmentDetailsSheet";
 import {
   AiSpreadsheet,
   type SpreadsheetColumn,
@@ -71,6 +73,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useSessionState } from "@/hooks/use-session-state";
 import type { ColumnDataType } from "@/lib/spreadsheet/columns";
+import type { CellExecutionMetadata } from "@/lib/spreadsheet/computed-columns";
 import {
   defaultFunctions,
   type SavedFunction,
@@ -119,8 +122,8 @@ export default function Worksheet() {
   );
   const [enrichmentAction, setEnrichmentAction] =
     useState<EnrichmentAction | null>(null);
-  const [enrichmentInputColumnId, setEnrichmentInputColumnId] =
-    useState<string>();
+  const [enrichmentPickerOpen, setEnrichmentPickerOpen] = useState(false);
+  const [openEnrichmentId, setOpenEnrichmentId] = useState<string | null>(null);
   const [functionLibraryOpen, setFunctionLibraryOpen] = useSessionState(
     "ploid:workspace:function-library",
     false,
@@ -184,6 +187,13 @@ export default function Worksheet() {
   );
   const [newSearchRunning, setNewSearchRunning] = useState(false);
   const [researching, setResearching] = useState(false);
+  const [functionProgress, setFunctionProgress] = useState<
+    Record<string, { total: number; completed: number; failed: number }>
+  >({});
+  const [cellExecution, setCellExecution] = useState<
+    Record<string, Record<string, CellExecutionMetadata>>
+  >({});
+  const workspaceRef = useRef<Workspace | null>(null);
   const [historyOpen, setHistoryOpen] = useSessionState(
     "ploid:workspace:history-open",
     false,
@@ -193,6 +203,9 @@ export default function Worksheet() {
     const data = (await response.json()) as { data: WorkspaceListItem[] };
     setWorkspaceList(data.data);
   };
+  useEffect(() => {
+    workspaceRef.current = workspace;
+  }, [workspace]);
   useEffect(() => {
     void fetch("/api/workspaces")
       .then((response) => response.json())
@@ -239,7 +252,68 @@ export default function Worksheet() {
     );
     const handle = (event: MessageEvent<string>) => {
       const payload = JSON.parse(event.data) as WorkspaceEvent;
+      if (
+        payload.type === "ai-column.row.running" ||
+        payload.type === "ai-column.row.completed" ||
+        payload.type === "ai-column.row.not_found" ||
+        payload.type === "ai-column.row.failed" ||
+        payload.type === "ai-column.row.waiting" ||
+        payload.type === "enrichment.row.stale"
+      ) {
+        const columnId = payload.data?.columnId;
+        const rowId = payload.data?.rowId;
+        if (typeof columnId === "string" && typeof rowId === "string") {
+          const status =
+            payload.type === "ai-column.row.running"
+              ? "running"
+              : payload.type === "enrichment.row.stale"
+                ? "stale"
+              : payload.type === "ai-column.row.waiting"
+                ? "waiting"
+                : payload.type === "ai-column.row.not_found"
+                  ? "not_found"
+                  : payload.type === "ai-column.row.failed"
+                    ? "failed"
+                    : "success";
+          setCellExecution((current) => ({
+            ...current,
+            [columnId]: {
+              ...current[columnId],
+              [rowId]: {
+                status,
+                ...(Array.isArray(payload.data?.waitingForColumnIds)
+                  ? {
+                      waitingForColumnIds: payload.data.waitingForColumnIds.filter(
+                        (id): id is string => typeof id === "string",
+                      ),
+                    }
+                  : {}),
+                ...(typeof payload.data?.text === "string"
+                  ? { error: payload.data.text }
+                  : {}),
+                updatedAt: new Date().toISOString(),
+              },
+            },
+          }));
+          // Header progress is derived by AiSpreadsheet from this authoritative
+          // row-state map. Do not increment a second counter here: repeated
+          // events and retries would otherwise inflate completion/failure
+          // totals and make a Ploid child column look permanently failed.
+        }
+      }
       if (payload.type === "agent.started") setResearching(true);
+      if (
+        payload.type === "enrichment.row.stale" &&
+        payload.data?.autoUpdate === true &&
+        typeof payload.data?.enrichmentId === "string" &&
+        typeof payload.data?.rowId === "string"
+      ) {
+        void fetch(`/api/workspaces/${activeWorkspaceId}/enrichments/${payload.data.enrichmentId}/run`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ scope: "selected", rowIds: [payload.data.rowId] }),
+        });
+      }
       if (payload.type === "agent.activity") {
         setResearching(true);
         setActivity(payload.data?.text);
@@ -280,6 +354,12 @@ export default function Worksheet() {
       "agent.completed",
       "agent.failed",
       "table.operations.applied",
+      "ai-column.row.running",
+      "ai-column.row.completed",
+      "ai-column.row.not_found",
+      "ai-column.row.failed",
+      "ai-column.row.waiting",
+      "enrichment.row.stale",
     ].forEach((type) => stream.addEventListener(type, handle));
     return () => {
       alive = false;
@@ -744,6 +824,9 @@ export default function Worksheet() {
             <SpreadsheetToolbar
               onAskAi={() => setAgentOpen(true)}
               onAddColumn={() => setAddColumnOpen(true)}
+              onAddEnrichment={() => {
+                setEnrichmentPickerOpen(true);
+              }}
               onFunctionLibrary={() => setFunctionLibraryOpen(true)}
               onUndo={() =>
                 setHistoryAction({ type: "undo", token: Date.now() })
@@ -790,6 +873,8 @@ export default function Worksheet() {
               <AiSpreadsheet
                 key={`${workspace.id}:${tableId}`}
                 table={workspace.table}
+                functionProgress={functionProgress}
+                cellExecution={cellExecution}
                 runRequest={null}
                 historyAction={historyAction}
                 addColumnRequest={addColumnRequest}
@@ -812,25 +897,161 @@ export default function Worksheet() {
                 onSaveFunction={(fn) =>
                   setSavedFunctions((current) => [...current, fn])
                 }
-                onRunFunctionColumn={async (columnId, limit) => {
-                  const response = await fetch(
+                onRunFunctionColumn={(columnId, options) => {
+                  const requestedRows = workspace.table.rows
+                    .filter(
+                      (row) =>
+                        !options.rowIds?.length || options.rowIds.includes(row.id),
+                    )
+                    .slice(0, options.limit ?? Number.POSITIVE_INFINITY);
+                  const total = requestedRows.length;
+                  const sourceColumn = workspace.table.columns.find(
+                    (column) => column.id === columnId,
+                  );
+                  const linkedColumnIds = sourceColumn?.functionBinding
+                    ? workspace.table.columns
+                        .filter(
+                          (column) =>
+                            column.functionBinding?.functionId ===
+                            sourceColumn.functionBinding?.functionId,
+                        )
+                        .map((column) => column.id)
+                    : [columnId];
+                  // Start the visual feedback as soon as the async run is
+                  // accepted, rather than waiting for the first row event. A
+                  // shared Ploid function queues all of its materialized
+                  // outputs together, because one request will settle them.
+                  setFunctionProgress((current) => ({
+                    ...current,
+                    ...Object.fromEntries(
+                      linkedColumnIds.map((id) => [
+                        id,
+                        { total, completed: 0, failed: 0 },
+                      ]),
+                    ),
+                  }));
+                  setCellExecution((current) => ({
+                    ...current,
+                    ...Object.fromEntries(
+                      linkedColumnIds.map((id) => [
+                        id,
+                        Object.fromEntries(
+                          requestedRows.map((row) => [
+                            row.id,
+                            { status: "queued" },
+                          ]),
+                        ),
+                      ]),
+                    ),
+                  }));
+                  if (process.env.NODE_ENV !== "production")
+                    console.info("[Column run] starting", {
+                      columnId,
+                      total,
+                      linkedOutputs: linkedColumnIds.length,
+                    });
+                  void fetch(
                     `/api/workspaces/${workspace.id}/ai-columns/${columnId}/run`,
                     {
                       method: "POST",
                       headers: { "content-type": "application/json" },
-                      body: JSON.stringify(limit === null ? {} : { limit }),
+                    body: JSON.stringify({
+                      ...(options.rowIds?.length ? { rowIds: options.rowIds } : {}),
+                      ...(typeof options.limit === "number"
+                        ? { limit: options.limit }
+                        : {}),
+                    }),
                     },
-                  );
-                  if (!response.ok) {
-                    const payload = (await response
-                      .json()
-                      .catch(() => null)) as { error?: string } | null;
-                    throw new Error(
-                      payload?.error ?? "Unable to queue column run",
-                    );
-                  }
+                  )
+                    .then(async (response) => {
+                      const payload = (await response
+                        .json()
+                        .catch(() => null)) as {
+                        error?: string;
+                        rows?: Array<{
+                          columnId: string;
+                          rowId: string;
+                          status: CellExecutionMetadata["status"];
+                          error?: string;
+                          waitingForColumnIds?: string[];
+                        }>;
+                      } | null;
+                      if (!response.ok)
+                        throw new Error(
+                          payload?.error ?? "Unable to run column",
+                        );
+                      const rowStates = payload?.rows;
+                      if (!rowStates) return;
+                      const statesByColumn = Object.groupBy(
+                        rowStates,
+                        (row) => row.columnId,
+                      );
+                      setCellExecution((current) => ({
+                        ...current,
+                        ...Object.fromEntries(
+                          Object.entries(statesByColumn).map(
+                            ([outputColumnId, rows]) => [
+                              outputColumnId,
+                              Object.fromEntries(
+                                (rows ?? []).map((row) => [
+                                  row.rowId,
+                                  {
+                                    status: row.status,
+                                    ...(row.error ? { error: row.error } : {}),
+                                    ...(row.waitingForColumnIds
+                                      ? {
+                                          waitingForColumnIds:
+                                            row.waitingForColumnIds,
+                                        }
+                                      : {}),
+                                  },
+                                ]),
+                              ),
+                            ],
+                          ),
+                        ),
+                      }));
+                      setFunctionProgress((current) => ({
+                        ...current,
+                        ...Object.fromEntries(
+                          Object.entries(statesByColumn).map(
+                            ([outputColumnId, rows]) => [
+                              outputColumnId,
+                              {
+                                total: rows?.length ?? 0,
+                                completed: (rows ?? []).filter((row) =>
+                                  ["success", "not_found", "failed"].includes(
+                                    row.status,
+                                  ),
+                                ).length,
+                                failed: (rows ?? []).filter(
+                                  (row) => row.status === "failed",
+                                ).length,
+                              },
+                            ],
+                          ),
+                        ),
+                      }));
+                    })
+                    .catch((error: unknown) => {
+                      setFunctionProgress((current) => {
+                        const next = { ...current };
+                        delete next[columnId];
+                        return next;
+                      });
+                      console.error("[Table] column run failed", error);
+                    });
                 }}
                 onDeleteColumn={async (columnId) => {
+                  const column = workspace.table.columns.find((item) => item.id === columnId);
+                  const enrichmentId = column?.enrichmentBinding?.enrichmentId;
+                  const enrichment = workspace.enrichments?.find((item) => item.id === enrichmentId);
+                  if (enrichment && enrichment.outputs.length === 1) {
+                    if (!window.confirm(`Remove the last output and delete ${enrichment.name}? This also removes its saved run metadata.`)) return;
+                    const response = await fetch(`/api/workspaces/${workspace.id}/enrichments/${enrichment.id}`, { method: "DELETE" });
+                    if (!response.ok) throw new Error("Unable to delete enrichment");
+                    return;
+                  }
                   const response = await fetch(
                     `/api/workspaces/${workspace.id}/operations`,
                     {
@@ -843,10 +1064,16 @@ export default function Worksheet() {
                   );
                   if (!response.ok) throw new Error("Unable to delete column");
                 }}
-                onEnrichColumn={(columnId, action) => {
-                  setEnrichmentInputColumnId(columnId);
-                  setEnrichmentAction(action);
+                onOpenEnrichment={setOpenEnrichmentId}
+                onRunEnrichment={async (enrichmentId, scope, rowIds) => {
+                  const response = await fetch(`/api/workspaces/${workspace.id}/enrichments/${enrichmentId}/run`, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ scope, rowIds }),
+                  });
+                  if (!response.ok) throw new Error("Unable to run enrichment");
                 }}
+                enrichments={workspace.enrichments}
               />
             )}
           </div>
@@ -931,6 +1158,23 @@ export default function Worksheet() {
           if (response.ok) setWorkspace((await response.json()) as Workspace);
         }}
       />
+      <EnrichmentPickerDialog
+        open={enrichmentPickerOpen}
+        onOpenChange={setEnrichmentPickerOpen}
+        onSelect={setEnrichmentAction}
+      />
+      <EnrichmentDetailsSheet
+        key={openEnrichmentId ?? "none"}
+        open={!!openEnrichmentId}
+        onOpenChange={(open) => !open && setOpenEnrichmentId(null)}
+        workspaceId={workspace.id}
+        table={workspace.table}
+        enrichment={workspace.enrichments?.find((item) => item.id === openEnrichmentId)}
+        onChanged={async () => {
+          const response = await fetch(`/api/workspaces/${workspace.id}`);
+          if (response.ok) setWorkspace((await response.json()) as Workspace);
+        }}
+      />
       {enrichmentAction && (
         <EnrichmentColumnSheet
           open={!!enrichmentAction}
@@ -938,10 +1182,30 @@ export default function Worksheet() {
           action={enrichmentAction}
           workspaceId={workspace.id}
           table={workspace.table}
-          initialInputColumnId={enrichmentInputColumnId}
-          onSaved={async () => {
+          onSaved={async (columnId, autoRun) => {
             const response = await fetch(`/api/workspaces/${workspace.id}`);
             if (response.ok) setWorkspace((await response.json()) as Workspace);
+            if (columnId && autoRun) {
+              const total = workspace.table.rows.length;
+              setFunctionProgress((current) => ({
+                ...current,
+                [columnId]: { total, completed: 0, failed: 0 },
+              }));
+              setCellExecution((current) => ({
+                ...current,
+                [columnId]: Object.fromEntries(
+                  workspace.table.rows.map((row) => [row.id, { status: "queued" }]),
+                ),
+              }));
+              void fetch(
+                `/api/workspaces/${workspace.id}/ai-columns/${columnId}/run`,
+                {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({}),
+                },
+              );
+            }
           }}
         />
       )}

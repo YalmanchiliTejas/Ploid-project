@@ -3,6 +3,15 @@ const baseUrl = "https://openrouter.ai/api/v1";
 const AUTO_ROUTER_ID = "openrouter/auto";
 
 /**
+ * OpenRouter's catalog can advertise a response-format parameter even when no
+ * provider is currently routable for it. Keep these models on the robust JSON
+ * prompting path until their provider routing supports native schemas.
+ */
+const LENIENT_ONLY_MODEL_IDS = new Set([
+  "z-ai/glm-5.3-flash",
+]);
+
+/**
  * Cache the model catalog so opening multiple AI-column dialogs does not
  * repeatedly call /models/user.
  */
@@ -329,13 +338,17 @@ export function normalizeOpenRouterModels(
           model.supported_parameters,
         );
 
-      const supportsStructuredOutput =
+      const advertisedStructuredOutput =
         supported.includes(
           "structured_outputs",
         ) ||
         supported.includes(
           "response_format",
         );
+
+      const supportsStructuredOutput =
+        advertisedStructuredOutput &&
+        !LENIENT_ONLY_MODEL_IDS.has(id);
 
       const contextLength =
         typeof model.context_length ===
@@ -495,10 +508,7 @@ export async function listOpenRouterModels(
     cachedModelCatalog.expiresAt >
       now
   ) {
-    return [
-      createAutoRouterModel(),
-      ...cachedModelCatalog.models,
-    ];
+    return withAutoRouter(cachedModelCatalog.models);
   }
 
   /**
@@ -511,10 +521,7 @@ export async function listOpenRouterModels(
     const models =
       await modelCatalogPromise;
 
-    return [
-      createAutoRouterModel(),
-      ...models,
-    ];
+    return withAutoRouter(models);
   }
 
   modelCatalogPromise =
@@ -532,13 +539,18 @@ export async function listOpenRouterModels(
         USER_MODELS_CACHE_MS,
     };
 
-    return [
-      createAutoRouterModel(),
-      ...models,
-    ];
+    return withAutoRouter(models);
   } finally {
     modelCatalogPromise = null;
   }
+}
+
+/** The authenticated OpenRouter catalog may already contain Auto Router. */
+function withAutoRouter(models: OpenRouterModel[]): OpenRouterModel[] {
+  return [
+    createAutoRouterModel(),
+    ...models.filter((model) => model.id !== AUTO_ROUTER_ID),
+  ];
 }
 
 function createAutoRouterModel(): OpenRouterModel {

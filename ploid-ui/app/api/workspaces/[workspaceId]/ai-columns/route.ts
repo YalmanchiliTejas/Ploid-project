@@ -54,14 +54,14 @@ export async function POST(
         { error: "Select an OpenRouter model" },
         { status: 400 },
       );
-    const supported = (await listOpenRouterModels()).some(
-      (item) => item.id === model && item.supportsStructuredOutput,
+    const available = (await listOpenRouterModels()).some(
+      (item) => item.id === model,
     );
-    if (!supported)
+    if (!available)
       return Response.json(
         {
           error:
-            "Select an OpenRouter model that supports strict structured output",
+            "Select an available OpenRouter model",
         },
         { status: 400 },
       );
@@ -104,6 +104,7 @@ export async function POST(
         : {}),
       functionBinding: {
         functionId: functionDefinition.id,
+        autoRun: body.runMode === "input_change",
         definition: functionDefinition,
         inputBindings: Object.fromEntries(
           inputColumnIds.map((id) => [

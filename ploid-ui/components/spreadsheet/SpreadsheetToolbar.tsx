@@ -25,6 +25,7 @@ import {
 export function SpreadsheetToolbar({
   onAskAi,
   onAddColumn,
+  onAddEnrichment,
   onFunctionLibrary,
   onUndo,
   onRedo,
@@ -35,6 +36,7 @@ export function SpreadsheetToolbar({
 }: {
   onAskAi: () => void;
   onAddColumn: () => void;
+  onAddEnrichment: () => void;
   onFunctionLibrary: () => void;
   onUndo: () => void;
   onRedo: () => void;
@@ -156,6 +158,10 @@ export function SpreadsheetToolbar({
         <Button variant="ghost" size="sm" onClick={onAddColumn}>
           <Plus className="size-3.5" />
           Add column
+        </Button>
+        <Button variant="ghost" size="sm" onClick={onAddEnrichment}>
+          <Sparkles className="size-3.5" />
+          Add enrichment
         </Button>
       </div>
       <span className="hidden whitespace-nowrap text-xs text-muted-foreground lg:inline">

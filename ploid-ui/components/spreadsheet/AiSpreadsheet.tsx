@@ -11,9 +11,19 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { GripVertical, LoaderCircle, Play, Sparkles } from "lucide-react";
+import {
+  AtSign,
+  Brain,
+  Check,
+  Clock3,
+  DatabaseZap,
+  GripVertical,
+  LoaderCircle,
+  Play,
+  Sparkles,
+  Workflow,
+} from "lucide-react";
 import { ColumnHeaderMenu, ColumnTypeIcon } from "./ColumnHeaderMenu";
-import type { EnrichmentAction } from "./EnrichmentColumnSheet";
 import { DeleteColumnDialog } from "./DeleteColumnDialog";
 import { EditColumnSheet } from "./EditColumnSheet";
 import { RenameColumnDialog } from "./RenameColumnDialog";
@@ -30,15 +40,43 @@ import { convertColumnValues } from "@/lib/spreadsheet/typeConversion";
 import type {
   TableOperation,
   WorkspaceColumn,
+  EnrichmentDefinition,
   WorkspaceTable,
 } from "@/lib/workspace/types";
 import { useSessionState } from "@/hooks/use-session-state";
+import {
+  columnExecutionKind,
+  executionPhase,
+  type CellExecutionMetadata,
+  type ColumnExecutionKind,
+} from "@/lib/spreadsheet/computed-columns";
 
 type RunRequest = { limit: number | null; token: number } | null;
+type ColumnRunOptions = {
+  limit?: number | null;
+  rowIds?: string[];
+};
 type HistoryAction = { type: "undo" | "redo"; token: number } | null;
 type UniverApi = ReturnType<typeof createSpreadsheet>["univerAPI"];
 export type SpreadsheetColumn = ColumnDefinition &
-  Pick<WorkspaceColumn, "functionBinding"> & { width: number };
+  Pick<WorkspaceColumn, "functionBinding" | "enrichmentBinding"> & { width: number };
+const executionIcon = (kind: ColumnExecutionKind) => {
+  const icons: Partial<Record<ColumnExecutionKind, typeof Workflow>> = {
+    function: Workflow,
+    ploid_enrichment: DatabaseZap,
+    ploid_social: AtSign,
+    ploid_agent: Sparkles,
+    openrouter_ai: Brain,
+  };
+  return icons[kind] ?? Workflow;
+};
+type EmbeddedFunctionDefinition = { name?: string };
+const sharedFunctionLabel = (column: SpreadsheetColumn) => {
+  const definition = column.functionBinding?.definition as
+    | EmbeddedFunctionDefinition
+    | undefined;
+  return definition?.name?.trim() || "Ploid Enrichment";
+};
 const textWidth = (value: unknown) => String(value).length * 7.2;
 const fitColumnWidth = (name: string, values: unknown[]) =>
   Math.max(
@@ -190,10 +228,14 @@ export function AiSpreadsheet({
   columnSnapshot,
   onColumnSnapshot,
   functions,
+  functionProgress,
+  cellExecution,
   onSaveFunction,
   onRunFunctionColumn,
   onDeleteColumn,
-  onEnrichColumn,
+  onOpenEnrichment,
+  onRunEnrichment,
+  enrichments,
 }: {
   runRequest: RunRequest;
   historyAction: HistoryAction;
@@ -210,13 +252,17 @@ export function AiSpreadsheet({
   columnSnapshot?: SpreadsheetColumn[] | null;
   onColumnSnapshot?: (columns: SpreadsheetColumn[]) => void;
   functions: SavedFunction[];
+  functionProgress?: Record<string, { total: number; completed: number; failed: number }>;
+  cellExecution?: Record<string, Record<string, CellExecutionMetadata>>;
   onSaveFunction: (value: SavedFunction) => void;
   onRunFunctionColumn?: (
     columnId: string,
-    limit: number | null,
+    options: ColumnRunOptions,
   ) => Promise<void> | void;
   onDeleteColumn?: (columnId: string) => Promise<void> | void;
-  onEnrichColumn?: (columnId: string, action: EnrichmentAction) => void;
+  onOpenEnrichment?: (enrichmentId: string) => void;
+  onRunEnrichment?: (enrichmentId: string, scope: "all" | "missing" | "stale" | "failed" | "test" | "selected", rowIds?: string[]) => Promise<void> | void;
+  enrichments?: EnrichmentDefinition[];
 }) {
   // Univer owns a viewport, so the parent cannot naturally collapse to its
   // cells. Keep large tables scrollable, but use a content-sized viewport for
@@ -240,7 +286,6 @@ export function AiSpreadsheet({
   const [status, setStatus] = useState("Ready");
   const [runDialog, setRunDialog] = useState<{
     column: SpreadsheetColumn;
-    limit: number | null;
   } | null>(null);
   const [queueingRun, setQueueingRun] = useState(false);
   const [columns, setColumns] = useState(() =>
@@ -278,6 +323,7 @@ export function AiSpreadsheet({
   const [conversionError, setConversionError] = useState<string | null>(null);
   const [univerReady, setUniverReady] = useState(false);
   const [viewportWidth, setViewportWidth] = useState(0);
+  const [executionScroll, setExecutionScroll] = useState({ left: 0, top: 0 });
   useEffect(() => {
     tableRef.current = table;
   }, [table]);
@@ -297,6 +343,53 @@ export function AiSpreadsheet({
   }, []);
   const activeColumn =
     activeIndex === null ? null : (columns[activeIndex] ?? null);
+  const enrichmentGroups = useMemo(() => {
+    const groups: Array<{
+      functionId: string;
+      start: number;
+      width: number;
+      column: SpreadsheetColumn;
+      count: number;
+    }> = [];
+    let offset = 0;
+    for (let index = 0; index < columns.length; index += 1) {
+      const column = columns[index];
+      const functionId = column.functionBinding?.functionId;
+      if (
+        !functionId ||
+        !column.functionBinding?.outputId ||
+        columnExecutionKind(column.dataType, column.functionBinding) !==
+          "ploid_enrichment"
+      ) {
+        offset += column.width;
+        continue;
+      }
+      let end = index + 1;
+      let width = column.width;
+      while (
+        end < columns.length &&
+        columns[end].functionBinding?.functionId === functionId
+      ) {
+        width += columns[end].width;
+        end += 1;
+      }
+      if (end - index > 1)
+        groups.push({
+          functionId,
+          start: offset,
+          width,
+          column,
+          count: end - index,
+        });
+      offset += width;
+      index = end - 1;
+    }
+    return groups;
+  }, [columns]);
+  const groupedFunctionIds = useMemo(
+    () => new Set(enrichmentGroups.map((group) => group.functionId)),
+    [enrichmentGroups],
+  );
   const lastColumnLetter = useMemo(
     () => columnLetter(Math.max(0, columns.length - 1)),
     [columns.length],
@@ -335,6 +428,9 @@ export function AiSpreadsheet({
     spreadsheetColumns(initialTable).forEach((column, index) =>
       sheet?.setColumnWidth(index, column.width),
     );
+    initialTable.columns.forEach((column, index) =>
+      applyColumnPresentation(index, column.dataType),
+    );
     initialTable.rows.forEach((row, rowIndex) => {
       initialTable.columns.forEach((column, columnIndex) => {
         if (column.dataType !== "url" && column.dataType !== "email") return;
@@ -346,7 +442,7 @@ export function AiSpreadsheet({
           .setHyperLink(destination, String(value));
       });
     });
-    initialTable.rows.forEach((_row, rowIndex) => sheet?.autoFitRow(rowIndex));
+    initialTable.rows.forEach((_row, rowIndex) => sheet?.setRowHeight(rowIndex, 42));
     const syncHeaderScroll = () => {
       const scrollState = univerAPI
         .getActiveWorkbook()
@@ -363,6 +459,18 @@ export function AiSpreadsheet({
         scrollState.offsetX;
       // Univer owns the body viewport. The header only mirrors it.
       headerScrollerRef.current.scrollLeft = scrollLeft;
+      const verticalState = scrollState as typeof scrollState & {
+        sheetViewStartRow?: number;
+        offsetY?: number;
+      };
+      const scrollTop =
+        (verticalState.sheetViewStartRow ?? 0) * 42 +
+        (verticalState.offsetY ?? 0);
+      setExecutionScroll((current) =>
+        current.left === scrollLeft && current.top === scrollTop
+          ? current
+          : { left: scrollLeft, top: scrollTop },
+      );
     };
     const scrollDisposable = univerAPI.addEvent(
       univerAPI.Event.Scroll,
@@ -433,11 +541,12 @@ export function AiSpreadsheet({
           .getRange(`${columnLetter(columnIndex)}${rowIndex + 1}`)
           .setHyperLink(destination, String(value));
       });
-      sheet.autoFitRow(rowIndex);
+      sheet.setRowHeight(rowIndex, 42);
     });
     nextColumns.forEach((column, index) => {
       const width = column.width;
       sheet.setColumnWidth(index, width);
+      applyColumnPresentation(index, column.dataType);
       nextColumns[index] = { ...column, width };
     });
     rowIdsRef.current = canonical.rows.map((row) => row.id);
@@ -470,6 +579,36 @@ export function AiSpreadsheet({
       ? apiRef.current.undo()
       : apiRef.current.redo());
   }, [historyAction]);
+  function applyColumnPresentation(
+    index: number,
+    dataType: ColumnDataType,
+  ) {
+    const api = apiRef.current;
+    const sheet = api?.getActiveWorkbook()?.getActiveSheet();
+    if (!api || !sheet) return;
+    const range = sheet.getRange(
+      `${columnLetter(index)}1:${columnLetter(index)}${Math.max(rowIdsRef.current.length, 1)}`,
+    );
+    const numberFormat =
+      dataType === "text" || dataType === "json"
+        ? "@"
+        : dataType === "number"
+          ? "0.########"
+          : dataType === "currency"
+            ? "$#,##0.00"
+            : dataType === "percentage"
+              ? "0.00%"
+              : dataType === "date"
+                ? "yyyy-mm-dd"
+                : "General";
+    range.setNumberFormat(numberFormat);
+    range.setDataValidation(null);
+    if (dataType === "boolean") {
+      range.setDataValidation(
+        api.newDataValidation().requireCheckbox("true", "false").build(),
+      );
+    }
+  }
   useEffect(() => {
     if (!addColumnRequest) return;
     const sheet = apiRef.current?.getActiveWorkbook()?.getActiveSheet();
@@ -479,6 +618,7 @@ export function AiSpreadsheet({
     const sourceColumns = columnsRef.current;
     sheet.insertColumns(index, 1);
     sheet.setColumnWidth(index, width);
+    applyColumnPresentation(index, addColumnRequest.dataType);
     sheet
       .getRange(
         `${columnLetter(index)}1:${columnLetter(index)}${Math.max(rowIdsRef.current.length, 1)}`,
@@ -530,6 +670,7 @@ export function AiSpreadsheet({
       const width = fitColumnWidth(operation.column.name, []);
       sheet.insertColumns(index, 1);
       sheet.setColumnWidth(index, width);
+      applyColumnPresentation(index, operation.column.dataType);
       setColumns((current) => [...current, { ...operation.column, width }]);
     }
     if (operation.type === "update_column") {
@@ -891,75 +1032,290 @@ export function AiSpreadsheet({
           </Badge>
         </div>
         <div ref={headerScrollerRef} className="custom-column-header">
+          {enrichmentGroups.length > 0 && (
+            <div
+              className="enrichment-group-rail"
+              style={{
+                width: columns.reduce(
+                  (total, column) => total + column.width,
+                  0,
+                ),
+              }}
+            >
+              {enrichmentGroups.map((group) => (
+                <div
+                  key={group.functionId}
+                  className="enrichment-group"
+                  style={{ left: group.start, width: group.width }}
+                  title={`One Ploid request per row · ${group.count} materialized outputs`}
+                >
+                  <DatabaseZap className="size-3 shrink-0" aria-hidden="true" />
+                  <span className="truncate">{sharedFunctionLabel(group.column)}</span>
+                  <span className="enrichment-group-count">{group.count} outputs</span>
+                  {onRunFunctionColumn && (
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      className="ml-auto size-5 text-primary"
+                      aria-label={`Run ${sharedFunctionLabel(group.column)}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setRunDialog({ column: group.column });
+                      }}
+                    >
+                      <Play className="size-3" />
+                    </Button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
           <div
             className="custom-column-track"
             style={{
               width: columns.reduce((total, column) => total + column.width, 0),
             }}
           >
-            {columns.map((column, index) => (
-              <div
-                key={column.id}
-                className="custom-column"
-                style={{
-                  width: column.width,
-                  backgroundColor: (
-                    columnColors[column.color ?? "default"] ??
-                    columnColors.default
-                  ).header,
-                }}
-                draggable
-                onDragStart={() => setDraggedColumn(index)}
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={() => {
-                  if (draggedColumn !== null) moveColumn(draggedColumn, index);
-                  setDraggedColumn(null);
-                }}
-              >
-                <div className="flex min-w-0 flex-1 items-center gap-2">
-                  {column.functionBinding ? (
-                    <Sparkles className="size-3.5 text-primary" />
-                  ) : (
-                    <ColumnTypeIcon type={column.dataType} />
+            {columns.map((column, index) => {
+              const progress = functionProgress?.[column.id];
+              const kind = columnExecutionKind(
+                column.dataType,
+                column.functionBinding,
+              );
+              const computed = kind !== "static" && kind !== "formula";
+              const cellStates = Object.values(cellExecution?.[column.id] ?? {});
+              const waiting = cellStates.filter(
+                (cell) => cell.status === "waiting",
+              ).length;
+              const running = cellStates.filter(
+                (cell) => cell.status === "running" || cell.status === "queued",
+              ).length;
+              const succeeded = cellStates.filter(
+                (cell) => cell.status === "success",
+              ).length;
+              const notFound = cellStates.filter(
+                (cell) => cell.status === "not_found",
+              ).length;
+              const failed = cellStates.filter(
+                (cell) => cell.status === "failed",
+              ).length;
+              const queued = cellStates.filter(
+                (cell) => cell.status === "queued",
+              ).length;
+              const eligible = Math.max(
+                progress?.total ?? 0,
+                cellStates.length,
+              );
+              const terminal = succeeded + notFound + failed;
+              const progressValue =
+                eligible > 0
+                  ? Math.min(
+                      100,
+                      Math.round((terminal / eligible) * 100),
+                    )
+                  : 0;
+              const ComputationIcon = executionIcon(kind);
+              const isSharedOutput = Boolean(
+                column.enrichmentBinding ||
+                  (column.functionBinding?.functionId &&
+                    groupedFunctionIds.has(column.functionBinding.functionId)),
+              );
+              const enrichment = column.enrichmentBinding
+                ? enrichments?.find((item) => item.id === column.enrichmentBinding?.enrichmentId)
+                : undefined;
+              const enrichmentTitle = enrichment
+                ? `${enrichment.name}\nInputs: ${Object.values(enrichment.inputBindings).map((binding) => binding.type === "column" ? table.columns.find((item) => item.id === binding.columnId)?.name ?? "Removed column" : String(binding.value)).join(", ")}\nAlso outputs: ${enrichment.outputs.map((output) => output.label).join(", ")}\nRun status: ${Object.values(enrichment.rowExecutions ?? {}).some((row) => row.status === "stale") ? "Stale" : "Up to date"}`
+                : undefined;
+              const statusLabel = running
+                ? `${progressValue}%`
+                : waiting
+                  ? `Waiting${waiting > 1 ? ` · ${waiting} rows` : ""}`
+                : succeeded || notFound || failed
+                  ? [
+                        succeeded ? `${succeeded} complete` : "",
+                        notFound ? `${notFound} not found` : "",
+                        failed ? `${failed} errors` : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")
+                    : eligible > 0 && terminal === eligible
+                      ? "Up to date"
+                      : "Ready";
+              return (
+                <div
+                  key={column.id}
+                  className={`custom-column${computed ? " custom-column--computed" : ""}${activeIndex === index ? " custom-column--active" : ""}`}
+                  style={{
+                    width: column.width,
+                    backgroundColor: (
+                      columnColors[column.color ?? "default"] ??
+                      columnColors.default
+                    ).header,
+                  }}
+                  draggable
+                  title={enrichmentTitle}
+                  onClick={() => setActiveIndex(index)}
+                  onDragStart={() => setDraggedColumn(index)}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={() => {
+                    if (draggedColumn !== null) moveColumn(draggedColumn, index);
+                    setDraggedColumn(null);
+                  }}
+                >
+                  <div className="custom-column-main">
+                    <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                      {computed ? (
+                        <ComputationIcon
+                          className="size-3.5 shrink-0 text-primary"
+                          aria-label={`${kind.replaceAll("_", " ")} column${column.functionBinding?.outputId ? ` · shared output: ${column.functionBinding.outputId}` : ""}`}
+                        />
+                      ) : <ColumnTypeIcon type={column.dataType} />}
+                      <span className="min-w-0 flex-1 truncate">{column.name}</span>
+                    </div>
+                    <div className="flex shrink-0 items-center">
+                      {computed && onRunFunctionColumn && !isSharedOutput && (
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          className="computed-column-control text-primary"
+                          title={`Run ${column.name}`}
+                          aria-label={`Open run options for ${column.name}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setRunDialog({ column });
+                          }}
+                        >
+                          <Play className="size-3.5" />
+                        </Button>
+                      )}
+                      <GripVertical className="column-drag-hint size-3.5" />
+                      <ColumnHeaderMenu
+                        columnName={column.name}
+                        dataType={column.dataType}
+                        onRename={() =>
+                          openAction(index, () => setRenameOpen(true))
+                        }
+                        onEdit={() => openAction(index, () => setEditOpen(true))}
+                        onInsert={(side) => insertColumn(index, side)}
+                        onDuplicate={() => duplicateColumn(index)}
+                        onDelete={() =>
+                          openAction(index, () => setDeleteOpen(true))
+                        }
+                        onSort={(direction) => sortColumn(index, direction)}
+                        onDataType={(dataType) => selectDataType(index, dataType)}
+                        onColor={(color) => applyColumnColor(index, color)}
+                        onTextToColumns={() =>
+                          openAction(index, () => setTextSplitOpen(true))
+                        }
+                        onSaveFunction={() =>
+                          openAction(index, () => setSaveFunctionOpen(true))
+                        }
+                        onDependencies={() =>
+                          openAction(index, () => setDependenciesOpen(true))
+                        }
+                        onOpenEnrichment={column.enrichmentBinding ? () => onOpenEnrichment?.(column.enrichmentBinding!.enrichmentId) : undefined}
+                        isFunctionColumn={!!column.functionBinding}
+                        isSharedOutput={isSharedOutput}
+                        sourceLabel={
+                          isSharedOutput ? sharedFunctionLabel(column) : undefined
+                        }
+                        onRun={() => setRunDialog({ column })}
+                        progress={progress}
+                      />
+                    </div>
+                  </div>
+                  {computed && (
+                    <div
+                      className="custom-column-status"
+                      title={`${statusLabel}${eligible ? ` · ${terminal}/${eligible} terminal rows` : ""}${queued ? ` · ${queued} queued` : ""}`}
+                    >
+                      {running ? (
+                        <LoaderCircle className="size-3 animate-spin" />
+                      ) : failed ? (
+                        <span className="text-destructive">⚠</span>
+                      ) : eligible > 0 && terminal === eligible ? (
+                        <Check className="size-3 text-primary" />
+                      ) : waiting ? (
+                        <Clock3 className="size-3" />
+                      ) : (
+                        <Play className="size-3" />
+                      )}
+                      {(running || queued > 0) && eligible > 0 ? (
+                        <span className="custom-column-progressbar" role="progressbar" aria-valuemin={0} aria-valuemax={eligible} aria-valuenow={terminal}>
+                          <span style={{ width: `${progressValue}%` }} />
+                        </span>
+                      ) : null}
+                      <span className="truncate">{statusLabel}</span>
+                    </div>
                   )}
-                  <span className="truncate">{column.name}</span>
                 </div>
-                <div className="flex shrink-0 items-center">
-                  <GripVertical className="column-drag-hint size-3.5" />
-                  <ColumnHeaderMenu
-                    columnName={column.name}
-                    dataType={column.dataType}
-                    onRename={() =>
-                      openAction(index, () => setRenameOpen(true))
-                    }
-                    onEdit={() => openAction(index, () => setEditOpen(true))}
-                    onInsert={(side) => insertColumn(index, side)}
-                    onDuplicate={() => duplicateColumn(index)}
-                    onDelete={() =>
-                      openAction(index, () => setDeleteOpen(true))
-                    }
-                    onSort={(direction) => sortColumn(index, direction)}
-                    onDataType={(dataType) => selectDataType(index, dataType)}
-                    onColor={(color) => applyColumnColor(index, color)}
-                    onTextToColumns={() =>
-                      openAction(index, () => setTextSplitOpen(true))
-                    }
-                    onSaveFunction={() =>
-                      openAction(index, () => setSaveFunctionOpen(true))
-                    }
-                    onDependencies={() =>
-                      openAction(index, () => setDependenciesOpen(true))
-                    }
-                    isFunctionColumn={!!column.functionBinding}
-                    onRun={(limit) => setRunDialog({ column, limit })}
-                    onEnrich={(action) => onEnrichColumn?.(column.id, action)}
-                  />
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
         <div ref={containerRef} className="univer-container" />
+        <div className="computed-cell-layer" aria-live="polite">
+          {columns.flatMap((column, columnIndex) => {
+            const offset = columns
+              .slice(0, columnIndex)
+              .reduce((total, item) => total + item.width, 0);
+            const kind = columnExecutionKind(column.dataType, column.functionBinding);
+            if (kind === "static" || kind === "formula") return [];
+            return table.rows.flatMap((row, rowIndex) => {
+              const metadata = cellExecution?.[column.id]?.[row.id];
+              if (!metadata || metadata.status === "success") return [];
+              const waitingNames = (metadata.waitingForColumnIds ?? [])
+                .map((id) => table.columns.find((item) => item.id === id)?.name)
+                .filter((name): name is string => !!name);
+              const label =
+                metadata.status === "waiting"
+                  ? waitingNames.length === 1
+                    ? `Waiting for ${waitingNames[0]}…`
+                    : waitingNames.length > 1
+                      ? `Waiting for ${waitingNames.length} inputs…`
+                      : "Waiting for input…"
+                  : metadata.status === "running"
+                    ? executionPhase(kind)
+                    : metadata.status === "queued"
+                      ? "Queued…"
+                      : metadata.status === "not_found"
+                        ? "— Not found"
+                        : metadata.status === "failed"
+                          ? metadata.error?.includes("Not enough ACU")
+                            ? "Insufficient Ploid capacity"
+                            : "⚠ Failed"
+                          : metadata.status === "skipped"
+                            ? "Skipped"
+                            : metadata.status === "stale"
+                              ? "Needs update"
+                              : "Ready";
+              return (
+                <div
+                  key={`${column.id}:${row.id}`}
+                  className={`computed-cell-state computed-cell-state--${metadata.status}`}
+                  style={{
+                    width: column.width - 2,
+                    transform: `translate(${offset - executionScroll.left + 1}px, ${rowIndex * 42 - executionScroll.top}px)`,
+                  }}
+                  title={
+                    metadata.error ??
+                    (waitingNames.length > 1
+                      ? `Missing inputs: ${waitingNames.join(", ")}`
+                      : label)
+                  }
+                  aria-label={label}
+                >
+                  {metadata.status === "running" ? (
+                    <LoaderCircle className="size-3.5 animate-spin" />
+                  ) : metadata.status === "waiting" || metadata.status === "queued" ? (
+                    <Clock3 className="size-3.5" />
+                  ) : null}
+                  <span className="truncate">{label}</span>
+                </div>
+              );
+            });
+          })}
+        </div>
       </div>
       <RenameColumnDialog
         open={renameOpen}
@@ -978,49 +1334,116 @@ export function AiSpreadsheet({
           <DialogHeader>
             <DialogTitle>Run {runDialog?.column.name}</DialogTitle>
             <DialogDescription>
-              {runDialog?.limit === null
-                ? `Queue this Function-backed column for all ${table.rows.length} rows.`
-                : `Queue this Function-backed column for the first ${Math.min(runDialog?.limit ?? 5, table.rows.length)} rows.`}
+              {runDialog?.column.functionBinding?.outputId
+                ? "This is a shared Ploid enrichment output. Running it executes the source function once per row and updates its sibling outputs together."
+                : "Choose the rows to run. Results appear in the table as each row settles."}
             </DialogDescription>
           </DialogHeader>
-          <div className="rounded-md border bg-muted/30 p-3 text-sm">
-            <div className="flex items-center gap-2">
-              <Play className="size-4 text-primary" />
-              <span className="font-medium">Function Runner</span>
-            </div>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Rows run with controlled concurrency and update this table as
-              results complete.
-            </p>
-          </div>
-          <div className="flex justify-end gap-2">
-            <Button variant="outline" onClick={() => setRunDialog(null)}>
-              Cancel
-            </Button>
-            <Button
-              disabled={queueingRun}
-              onClick={async () => {
-                if (!runDialog || !onRunFunctionColumn) return;
-                setQueueingRun(true);
-                try {
-                  await onRunFunctionColumn(
-                    runDialog.column.id,
-                    runDialog.limit,
-                  );
-                  setRunDialog(null);
-                } finally {
-                  setQueueingRun(false);
-                }
-              }}
-            >
-              <Play className="size-4" />
-              {queueingRun
-                ? "Queueing…"
-                : runDialog?.limit === null
-                  ? "Run all"
-                  : "Run first 5"}
-            </Button>
-          </div>
+          {(() => {
+            const column = runDialog?.column;
+            const states = column ? cellExecution?.[column.id] ?? {} : {};
+            const valueFor = (rowId: string) =>
+              column ? table.rows.find((row) => row.id === rowId)?.cells[column.id] : null;
+            const missingRowIds = table.rows
+              .filter((row) => {
+                const state = states[row.id]?.status;
+                const value = valueFor(row.id);
+                return (
+                  state === "idle" ||
+                  state === "stale" ||
+                  state === "waiting" ||
+                  (!state && (value === null || value === undefined || value === ""))
+                );
+              })
+              .map((row) => row.id);
+            const failedRowIds = table.rows
+              .filter((row) => states[row.id]?.status === "failed")
+              .map((row) => row.id);
+            const staleRowIds = table.rows
+              .filter((row) => states[row.id]?.status === "stale")
+              .map((row) => row.id);
+            const start = async (options: ColumnRunOptions, enrichmentScope?: "all" | "missing" | "stale" | "failed" | "test") => {
+              if (!column || !onRunFunctionColumn) return;
+              setQueueingRun(true);
+              try {
+                if (column.enrichmentBinding && onRunEnrichment) {
+                  const scope = enrichmentScope ?? (options.limit === 10 ? "test" : options.rowIds ? "missing" : "all");
+                  await onRunEnrichment(column.enrichmentBinding.enrichmentId, scope, options.rowIds);
+                } else await onRunFunctionColumn(column.id, options);
+                setRunDialog(null);
+              } finally {
+                setQueueingRun(false);
+              }
+            };
+            const actions: Array<{
+              label: string;
+              detail: string;
+              options: ColumnRunOptions;
+              enrichmentScope?: "all" | "missing" | "stale" | "failed" | "test";
+              disabled?: boolean;
+            }> = [
+              {
+                label: "Run missing rows",
+                detail: `${missingRowIds.length} row${missingRowIds.length === 1 ? "" : "s"} without a settled value`,
+                options: { rowIds: missingRowIds },
+                enrichmentScope: "missing",
+                disabled: missingRowIds.length === 0,
+              },
+              {
+                label: "Run stale rows",
+                detail: `${staleRowIds.length} row${staleRowIds.length === 1 ? "" : "s"} with changed inputs`,
+                options: { rowIds: staleRowIds },
+                enrichmentScope: "stale",
+                disabled: staleRowIds.length === 0,
+              },
+              {
+                label: "Retry failed rows",
+                detail: `${failedRowIds.length} row${failedRowIds.length === 1 ? "" : "s"} with a provider or request error`,
+                options: { rowIds: failedRowIds },
+                enrichmentScope: "failed",
+                disabled: failedRowIds.length === 0,
+              },
+              {
+                label: "Run first 10",
+                detail: `Test the first ${Math.min(10, table.rows.length)} rows`,
+                options: { limit: 10 },
+                enrichmentScope: "test",
+                disabled: table.rows.length === 0,
+              },
+              {
+                label: "Run all rows",
+                detail: `${table.rows.length} rows · controlled provider concurrency`,
+                options: { limit: null },
+                enrichmentScope: "all",
+                disabled: table.rows.length === 0,
+              },
+            ];
+            return (
+              <div className="grid gap-1">
+                {actions.map((action) => (
+                  <Button
+                    key={action.label}
+                    variant="ghost"
+                    className="h-auto justify-between px-3 py-2.5 text-left"
+                    disabled={queueingRun || action.disabled}
+                    onClick={() => void start(action.options, action.enrichmentScope)}
+                  >
+                    <span className="grid gap-0.5">
+                      <span className="font-medium">{action.label}</span>
+                      <span className="text-xs font-normal text-muted-foreground">
+                        {action.detail}
+                      </span>
+                    </span>
+                    {queueingRun ? (
+                      <LoaderCircle className="size-4 animate-spin" />
+                    ) : (
+                      <Play className="size-4 text-primary" />
+                    )}
+                  </Button>
+                ))}
+              </div>
+            );
+          })()}
         </DialogContent>
       </Dialog>
       {editOpen && (

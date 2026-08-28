@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, Play, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -51,11 +51,17 @@ type Config = {
   systemPrompt?: string;
   runMode?: "manual" | "input_change" | "scheduled";
 };
+type RunProgress = {
+  total: number;
+  completed: number;
+  failed: number;
+};
 const initialConfig: Config = {
   name: "",
   promptTemplate: "",
   inputColumnIds: [],
   outputType: "text",
+  model: "openrouter/auto",
   runMode: "manual",
 };
 
@@ -80,6 +86,7 @@ export function AiColumnSheet({
   const [error, setError] = useState<string>();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [savedColumnId, setSavedColumnId] = useState<string>();
+  const [runProgress, setRunProgress] = useState<RunProgress>();
   const [models, setModels] = useState<
     Array<{ id: string; name: string; supportsStructuredOutput: boolean }>
   >([]);
@@ -92,6 +99,7 @@ export function AiColumnSheet({
     setError(undefined);
     setPickerOpen(false);
     setSavedColumnId(undefined);
+    setRunProgress(undefined);
   };
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputColumns = useMemo(
@@ -164,6 +172,28 @@ export function AiColumnSheet({
       setModels(payload.data);
     }
   };
+  useEffect(() => {
+    if (!savedColumnId) return;
+    const stream = new EventSource(`/api/workspaces/${workspaceId}/events`);
+    const updateProgress = (failed: boolean) => (event: MessageEvent<string>) => {
+      const payload = JSON.parse(event.data) as {
+        data?: { columnId?: string };
+      };
+      if (payload.data?.columnId !== savedColumnId) return;
+      setRunProgress((current) =>
+        current
+          ? {
+              ...current,
+              completed: Math.min(current.total, current.completed + 1),
+              failed: current.failed + Number(failed),
+            }
+          : current,
+      );
+    };
+    stream.addEventListener("ai-column.row.completed", updateProgress(false));
+    stream.addEventListener("ai-column.row.failed", updateProgress(true));
+    return () => stream.close();
+  }, [savedColumnId, workspaceId]);
   const save = async () => {
     if (!config.name.trim() || !config.promptTemplate.trim() || saving) return;
     setSaving(true);
@@ -195,7 +225,9 @@ export function AiColumnSheet({
   };
   const run = async (limit?: number) => {
     if (!savedColumnId) return;
-    await fetch(
+    const total = Math.min(limit ?? table.rows.length, table.rows.length);
+    setRunProgress({ total, completed: 0, failed: 0 });
+    const response = await fetch(
       `/api/workspaces/${workspaceId}/ai-columns/${savedColumnId}/run`,
       {
         method: "POST",
@@ -203,6 +235,10 @@ export function AiColumnSheet({
         body: JSON.stringify({ limit }),
       },
     );
+    if (!response.ok) {
+      setRunProgress(undefined);
+      throw new Error("Unable to start AI column run");
+    }
   };
   return (
     <Sheet
@@ -326,30 +362,23 @@ export function AiColumnSheet({
                   onValueChange={(model) => setConfig({ ...config, model })}
                 >
                   <SelectTrigger>
-                    <SelectValue placeholder="Select a structured-output model" />
+                    <SelectValue placeholder="Select a model" />
                   </SelectTrigger>
                   <SelectContent>
                     {models.map((model) => (
                       <SelectItem
                         key={model.id}
                         value={model.id}
-                        disabled={!model.supportsStructuredOutput}
                       >
                         <span className="flex items-center gap-2">
                           {model.name}
-                          {!model.supportsStructuredOutput && (
-                            <span className="text-xs text-muted-foreground">
-                              structured output unavailable
-                            </span>
-                          )}
                         </span>
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  All OpenRouter models are listed; AI columns require one that
-                  advertises structured output.
+                  Auto is recommended.
                 </p>
               </div>
               <div className="grid gap-2">
@@ -471,8 +500,33 @@ export function AiColumnSheet({
               </div>
               {error && <p className="text-sm text-destructive">{error}</p>}
               {savedColumnId && (
-                <div className="flex flex-wrap gap-2 rounded-md bg-muted p-3">
-                  <Badge variant="secondary">Not run</Badge>
+                <div className="grid gap-3 rounded-md bg-muted p-3">
+                  {runProgress ? (
+                    <div className="grid gap-1.5">
+                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                        <span>
+                          {runProgress.completed < runProgress.total
+                            ? "Running"
+                            : "Complete"}
+                        </span>
+                        <span>
+                          {runProgress.completed} / {runProgress.total}
+                          {runProgress.failed ? ` (${runProgress.failed} failed)` : ""}
+                        </span>
+                      </div>
+                      <div className="h-2 overflow-hidden rounded-full bg-background">
+                        <div
+                          className="h-full bg-primary transition-all"
+                          style={{
+                            width: `${runProgress.total ? (runProgress.completed / runProgress.total) * 100 : 0}%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <Badge variant="secondary">Not run</Badge>
+                  )}
+                  <div className="flex flex-wrap gap-2">
                   <Button size="sm" variant="outline" onClick={() => run(5)}>
                     <Play className="size-3.5" />
                     Run first 5
@@ -481,6 +535,7 @@ export function AiColumnSheet({
                     <Play className="size-3.5" />
                     Run all
                   </Button>
+                  </div>
                 </div>
               )}
             </div>

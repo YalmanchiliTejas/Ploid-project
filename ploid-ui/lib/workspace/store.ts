@@ -67,6 +67,7 @@ export function createWorkspace(input: {
     agentTurns: [],
     notices: [],
     peopleSearches: [],
+    enrichments: [],
   });
 }
 export function addTable(workspaceId: string, name: string) {

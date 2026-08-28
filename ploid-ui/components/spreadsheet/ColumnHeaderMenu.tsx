@@ -43,7 +43,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { dataTypes, type ColumnDataType } from "@/lib/spreadsheet/columns";
-import type { EnrichmentAction } from "./EnrichmentColumnSheet";
 
 const typeIcons: Record<ColumnDataType, typeof Type> = {
   text: Type,
@@ -90,9 +89,12 @@ type Props = {
   onTextToColumns: () => void;
   onSaveFunction: () => void;
   onDependencies: () => void;
-  onEnrich?: (action: EnrichmentAction) => void;
+  onOpenEnrichment?: () => void;
   isFunctionColumn?: boolean;
+  isSharedOutput?: boolean;
+  sourceLabel?: string;
   onRun?: (limit: number | null) => void;
+  progress?: { total: number; completed: number; failed: number };
 };
 
 export function ColumnHeaderMenu({
@@ -109,10 +111,18 @@ export function ColumnHeaderMenu({
   onTextToColumns,
   onSaveFunction,
   onDependencies,
-  onEnrich,
+  onOpenEnrichment,
   isFunctionColumn = false,
+  isSharedOutput = false,
+  sourceLabel,
   onRun,
+  progress,
 }: Props) {
+  const progressValue =
+    progress && progress.total > 0
+      ? Math.min(100, Math.round((progress.completed / progress.total) * 100))
+      : 0;
+  const isRunning = !!progress && progress.completed < progress.total;
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -126,13 +136,36 @@ export function ColumnHeaderMenu({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-64">
+        {progress && (
+          <div className="px-2 py-2">
+            <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
+              <span>{isRunning ? "Running" : "Complete"}</span>
+              <span>
+                {progress.completed}/{progress.total}
+                {progress.failed ? ` · ${progress.failed} failed` : ""}
+              </span>
+            </div>
+            <div
+              className="h-1.5 overflow-hidden rounded-full bg-muted"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={progress.total}
+              aria-valuenow={progress.completed}
+            >
+              <div
+                className="h-full bg-primary transition-[width]"
+                style={{ width: `${progressValue}%` }}
+              />
+            </div>
+          </div>
+        )}
         <DropdownMenuItem onSelect={onRename}>
           <Pencil className="size-4" />
           Rename column
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onEdit}>
+        <DropdownMenuItem onSelect={isSharedOutput && onOpenEnrichment ? onOpenEnrichment : onEdit}>
           <Settings2 className="size-4" />
-          Edit column
+          {isSharedOutput ? "Open enrichment" : "Edit column"}
         </DropdownMenuItem>
         <DropdownMenuSub>
           <DropdownMenuSubTrigger>
@@ -221,45 +254,12 @@ export function ColumnHeaderMenu({
           <Cpu className="size-4" />
           Save as function
         </DropdownMenuItem>
-        {onEnrich && (
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger>
-              <Sparkles className="size-4" />
-              Enrich this column
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent className="w-48">
-              {(
-                [
-                  ["Find work email", "work_email"],
-                  ["Find phone", "phone"],
-                  ["Enrich person", "person"],
-                  ["Social profile", "social"],
-                  ["LinkedIn profile", "linkedin"],
-                  ["GitHub profile", "github"],
-                  ["X profile", "x"],
-                  ["Instagram profile", "instagram"],
-                  ["TikTok profile", "tiktok"],
-                  ["YouTube profile", "youtube"],
-                  ["Reddit profile", "reddit"],
-                  ["Facebook profile", "facebook"],
-                ] as Array<[string, EnrichmentAction]>
-              ).map(([label, action]) => (
-                <DropdownMenuItem
-                  key={action}
-                  onSelect={() => onEnrich(action)}
-                >
-                  {label}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-        )}
         <DropdownMenuItem onSelect={onTextToColumns}>
           <Columns3 className="size-4" />
           Text to columns
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        {isFunctionColumn && onRun && (
+        {isFunctionColumn && onRun && !isSharedOutput && (
           <>
             <DropdownMenuItem onSelect={() => onRun(5)}>
               <Play className="size-4" />
@@ -270,6 +270,14 @@ export function ColumnHeaderMenu({
               Run all
             </DropdownMenuItem>
             <DropdownMenuSeparator />
+          </>
+        )}
+        {isSharedOutput && sourceLabel && onRun && (
+          <>
+            <DropdownMenuSeparator />
+            <div className="px-2 py-1.5 text-xs text-muted-foreground">Generated by: {sourceLabel}</div>
+            <DropdownMenuItem onSelect={() => onRun(10)}><Play className="size-4" />Test 10 rows</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => onRun(null)}><Play className="size-4" />Run enrichment</DropdownMenuItem>
           </>
         )}
         <DropdownMenuItem onSelect={() => onSort("asc")}>
@@ -283,7 +291,7 @@ export function ColumnHeaderMenu({
         <DropdownMenuSeparator />
         <DropdownMenuItem variant="destructive" onSelect={onDelete}>
           <Trash2 className="size-4" />
-          Delete column
+          {isSharedOutput ? "Remove output column" : "Delete column"}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

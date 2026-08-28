@@ -112,6 +112,15 @@ export const TableService = {
             inputBindings,
           };
         });
+        // Removing an output intentionally does not delete its enrichment.
+        // The last-output confirmation belongs to the enrichment UI/API.
+        workspace.enrichments ??= [];
+        workspace.enrichments.forEach((enrichment) => {
+          enrichment.outputs = enrichment.outputs.filter(
+            (output) => output.columnId !== operation.columnId,
+          );
+          enrichment.updatedAt = new Date().toISOString();
+        });
         eventQueue.push(
           newEvent(workspaceId, "table.column.deleted", { operation }),
         );
@@ -127,6 +136,22 @@ export const TableService = {
           const row = table.rows.find((item) => item.id === update.rowId);
           if (row) row.cells[update.columnId] = update.value;
         });
+        // Input changes invalidate the shared enrichment execution exactly
+        // once; output columns merely project that state.
+        for (const update of operation.updates) {
+          workspace.enrichments?.forEach((enrichment) => {
+            const isInput = Object.values(enrichment.inputBindings).some(
+              (binding) => binding.type === "column" && binding.columnId === update.columnId,
+            );
+            if (!isInput) return;
+            const execution = enrichment.rowExecutions?.[update.rowId];
+            if (execution) {
+              execution.status = "stale";
+              enrichment.updatedAt = new Date().toISOString();
+              enrichment.outputs.forEach((output) => eventQueue.push(newEvent(workspaceId, "enrichment.row.stale", { enrichmentId: enrichment.id, columnId: output.columnId, rowId: update.rowId, autoUpdate: enrichment.runSettings.autoUpdate })));
+            }
+          });
+        }
         eventQueue.push(
           newEvent(workspaceId, "table.cells.updated", { operation }),
         );

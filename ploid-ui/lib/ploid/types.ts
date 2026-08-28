@@ -1,10 +1,26 @@
 /** Types mirror the public fields in Ploid's current OpenAPI schema. */
 export type PloidMeta = {
   request_id?: string;
+  credits_charged?: number;
+  warnings?: unknown[];
   acu_limit?: number;
   acu_used?: number;
   warning?: "search_timeout";
   [key: string]: unknown;
+};
+
+export type NormalizedPersonEnrichment = {
+  fields: Partial<
+    Record<
+      "profile" | "email" | "phone",
+      { status: "success" | "not_found" | "failed"; value: unknown | null }
+    >
+  >;
+  warnings: unknown[];
+  requestId?: string;
+  creditsCharged?: number;
+  /** Available for run details only; never rendered into a spreadsheet cell. */
+  raw: unknown;
 };
 
 export type PloidResponse<T> = { data: T; meta: PloidMeta };

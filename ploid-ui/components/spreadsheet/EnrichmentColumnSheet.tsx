@@ -11,6 +11,7 @@ import {
   UserRound,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -86,21 +87,24 @@ export function EnrichmentColumnSheet({
   workspaceId: string;
   table: WorkspaceTable;
   initialInputColumnId?: string;
-  onSaved: () => Promise<void> | void;
+  onSaved: (columnId?: string, autoRun?: boolean) => Promise<void> | void;
 }) {
   const isSocial = socialActions.has(action);
   const defaultPlatform: string =
     action === "social" ? "linkedin" : isSocial ? action : "linkedin";
   const [inputColumnId, setInputColumnId] = useState(initialInputColumnId ?? "");
+  const [firstNameColumnId, setFirstNameColumnId] = useState("");
+  const [lastNameColumnId, setLastNameColumnId] = useState("");
   const [platform, setPlatform] = useState(defaultPlatform);
-  const [outputField, setOutputField] = useState(
+  const [socialFieldsText, setSocialFieldsText] = useState("");
+  const [personFields, setPersonFields] = useState<Array<"profile" | "email" | "phone">>(
     action === "work_email"
-      ? "email"
+      ? ["email"]
       : action === "phone"
-        ? "phone"
+        ? ["phone"]
         : action === "person"
-          ? "profile"
-          : "",
+          ? ["profile"]
+          : [],
   );
   const [name, setName] = useState("");
   const [autoUpdate, setAutoUpdate] = useState(true);
@@ -111,6 +115,8 @@ export function EnrichmentColumnSheet({
     enriched: number;
     notFound: number;
     failed: number;
+    providerRequests?: number;
+    outputs?: Record<string, { found: number; notFound: number; failed: number }>;
   }>();
   const inputColumns = useMemo(
     () =>
@@ -132,6 +138,10 @@ export function EnrichmentColumnSheet({
       );
       return;
     }
+    if (!isSocial && !personFields.length) {
+      setError("Choose at least one enrichment output");
+      return;
+    }
     setError(undefined);
     if (test) setTesting(true);
     else setSaving(true);
@@ -144,22 +154,32 @@ export function EnrichmentColumnSheet({
           body: JSON.stringify({
             kind: isSocial ? "social" : "person",
             inputColumnId,
+            firstNameColumnId,
+            lastNameColumnId,
             platform,
-            outputField,
+            socialFields: socialFieldsText.split(",").map((field) => field.trim()).filter(Boolean),
+            outputFields: personFields,
             name,
             autoUpdate,
           }),
         },
       );
       const payload = (await response.json()) as {
-        data?: { enriched: number; notFound: number; failed: number };
+        data?: {
+          enriched: number;
+          notFound: number;
+          failed: number;
+          providerRequests?: number;
+          outputs?: Record<string, { found: number; notFound: number; failed: number }>;
+          column?: { id: string };
+        };
         error?: string;
       };
       if (!response.ok)
         throw new Error(payload.error ?? "Unable to configure enrichment");
       if (test && payload.data) setTestSummary(payload.data);
       if (!test) {
-        await onSaved();
+        await onSaved(payload.data?.column?.id, autoUpdate);
         onOpenChange(false);
       }
     } catch (cause) {
@@ -249,36 +269,62 @@ export function EnrichmentColumnSheet({
             </p>
           </div>
           {!isSocial && (
-            <div className="grid gap-2">
-              <Label>Output</Label>
-              <Select value={outputField} onValueChange={setOutputField}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="email">Work Email</SelectItem>
-                  <SelectItem value="phone">Phone</SelectItem>
-                  <SelectItem value="profile">Full Profile (JSON)</SelectItem>
-                </SelectContent>
-              </Select>
+            <>
+            <div className="grid gap-3">
+              <Label>Optional identity inputs</Label>
+              {[["First name", firstNameColumnId, setFirstNameColumnId], ["Last name", lastNameColumnId, setLastNameColumnId]].map(([label, value, onChange]) => (
+                <div className="grid gap-1" key={label as string}>
+                  <Label className="text-xs font-normal text-muted-foreground">{label as string}</Label>
+                  <Select value={(value as string) || "none"} onValueChange={(next) => (onChange as (value: string) => void)(next === "none" ? "" : next)}>
+                    <SelectTrigger><SelectValue placeholder="Not mapped" /></SelectTrigger>
+                    <SelectContent><SelectItem value="none">Not mapped</SelectItem>{table.columns.map((column) => <SelectItem key={column.id} value={column.id}>{column.name}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+              ))}
             </div>
+            <div className="grid gap-2">
+              <Label>Outputs</Label>
+              <div className="grid gap-2 rounded-md border p-3">
+                {(
+                  [
+                    ["email", "Work Email"],
+                    ["phone", "Phone"],
+                    ["profile", "Profile"],
+                  ] as const
+                ).map(([field, label]) => (
+                  <label key={field} className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={personFields.includes(field)}
+                      onCheckedChange={(checked) =>
+                        setPersonFields((current) =>
+                          checked
+                            ? [...new Set([...current, field])]
+                            : current.filter((value) => value !== field),
+                        )
+                      }
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Selected outputs share one Ploid request per row.
+              </p>
+            </div>
+            </>
           )}
           {isSocial && (
             <div className="grid gap-2">
-              <Label>
-                Profile field{" "}
-                <span className="font-normal text-muted-foreground">
-                  (optional)
-                </span>
-              </Label>
+              <Label>Profile fields</Label>
               <Input
-                value={outputField}
-                onChange={(event) => setOutputField(event.target.value)}
-                placeholder="Leave empty to keep the full profile JSON"
+                value={socialFieldsText}
+                onChange={(event) => setSocialFieldsText(event.target.value)}
+                placeholder="Comma-separated documented fields, e.g. username, bio"
               />
               <p className="text-xs text-muted-foreground">
-                Social profile shapes vary by platform. The full raw profile is
-                always retained in run metadata.
+                Ploid’s OpenAPI intentionally leaves social profile keys
+                platform-dependent. Select known fields; raw profile JSON is
+                retained only in run metadata and is never a table column.
               </p>
             </div>
           )}
@@ -312,6 +358,8 @@ export function EnrichmentColumnSheet({
                 </span>{" "}
                 · {testSummary.notFound} not found · {testSummary.failed} failed
               </p>
+              {testSummary.providerRequests !== undefined && <p className="mt-1 text-xs text-muted-foreground">Provider requests: {testSummary.providerRequests}</p>}
+              {testSummary.outputs && <div className="mt-2 grid gap-1 text-xs">{Object.entries(testSummary.outputs).map(([field, summary]) => <p key={field}><span className="font-medium">{field}</span> · {summary.found} found · {summary.notFound} not found{summary.failed ? ` · ${summary.failed} failed` : ""}</p>)}</div>}
             </div>
           )}
           {error && <p className="text-sm text-destructive">{error}</p>}

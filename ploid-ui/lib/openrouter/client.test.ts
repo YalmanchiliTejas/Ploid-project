@@ -21,8 +21,36 @@ describe("OpenRouter model normalization", () => {
         id: "provider/structured",
         name: "Structured",
         supportsStructuredOutput: true,
+        preferredStructuredOutputMode: "strict",
+        inputModalities: [],
+        outputModalities: [],
+        contextLength: undefined,
       },
-      { id: "provider/plain", name: "Plain", supportsStructuredOutput: false },
+      {
+        id: "provider/plain",
+        name: "Plain",
+        supportsStructuredOutput: false,
+        preferredStructuredOutputMode: "lenient",
+        inputModalities: [],
+        outputModalities: [],
+        contextLength: undefined,
+      },
     ]);
+  });
+
+  it("uses lenient output for models with unavailable native schema routing", () => {
+    expect(
+      normalizeOpenRouterModels([
+        {
+          id: "z-ai/glm-5.3-flash",
+          name: "GLM 5.3 Flash",
+          supported_parameters: ["response_format"],
+        },
+      ])[0],
+    ).toMatchObject({
+      id: "z-ai/glm-5.3-flash",
+      supportsStructuredOutput: false,
+      preferredStructuredOutputMode: "lenient",
+    });
   });
 });

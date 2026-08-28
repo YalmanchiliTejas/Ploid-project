@@ -1,5 +1,4 @@
 import { runBoundColumn } from "@/lib/functions/service";
-import { emitWorkspaceEvent, newEvent } from "@/lib/workspace/store";
 
 export async function POST(
   request: Request,
@@ -16,34 +15,26 @@ export async function POST(
       : undefined;
     const limit =
       typeof body.limit === "number" && body.limit > 0 ? body.limit : undefined;
-    // This endpoint intentionally queues work and returns 202. Always handle
-    // the detached promise: otherwise a provider/TableService failure becomes
-    // an uncaught Next.js exception and masks the real error with a dev-overlay
-    // CodeFrameColorMode message.
-    void runBoundColumn(workspaceId, columnId, { rowIds, limit }).catch(
-      (error: unknown) => {
-        const message =
-          error instanceof Error ? error.message : "AI column run failed";
-        if (process.env.NODE_ENV !== "production")
-          console.error("[AI column run failed]", {
-            workspaceId,
-            columnId,
-            message,
-          });
-        emitWorkspaceEvent(
-          newEvent(workspaceId, "ai-column.run.failed", {
-            columnId,
-            text: message,
-          }),
-        );
-      },
-    );
-    return Response.json({ status: "queued" }, { status: 202 });
+    if (process.env.NODE_ENV !== "production")
+      console.info("[Column run] received", {
+        workspaceId,
+        columnId,
+        limit,
+        rowCount: rowIds?.length,
+      });
+    // Keep the request alive while the column runs. A detached promise can be
+    // discarded as soon as a serverless request returns its 202 response,
+    // leaving the run permanently queued with no row events.
+    const rows = await runBoundColumn(workspaceId, columnId, { rowIds, limit });
+    if (process.env.NODE_ENV !== "production")
+      console.info("[Column run] completed", { workspaceId, columnId });
+    return Response.json({ status: "complete", rows });
   } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "AI column run failed";
     return Response.json(
       {
-        error:
-          error instanceof Error ? error.message : "Unable to run AI column",
+        error: message,
       },
       { status: 400 },
     );

@@ -59,7 +59,7 @@ export async function POST(
     };
     const config = await openRouterStructured<Record<string, unknown>>({
       system:
-        "You configure AI-powered spreadsheet columns. Return only the requested JSON. Do not perform the research. Infer Boolean when the user asks whether something is true/false, is a fit, or asks a yes/no question.",
+        "You configure AI-powered spreadsheet columns. Return only the requested JSON. Do not perform the research. Infer Boolean when the user asks whether something is true/false, is a fit, or asks a yes/no question. AI columns can use only the supplied cell values: URLs, names, and companies are identifiers rather than evidence. Configure the column to return null for Boolean or numeric results when the supplied values do not explicitly establish the answer; never turn missing information into false, true, or 0.",
       prompt: [
         "Create a lightweight reusable AI-column configuration.",
         `User instruction: ${body.instruction.trim()}`,

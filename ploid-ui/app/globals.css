@@ -1141,9 +1141,9 @@ button {
   position: relative;
   z-index: 4;
   display: flex;
-  height: 44px;
-  min-height: 44px;
-  flex: 0 0 44px;
+  height: 98px;
+  min-height: 98px;
+  flex: 0 0 98px;
   align-items: stretch;
   border-bottom: 1px solid var(--line);
   background: #fbfcfd;
@@ -1154,26 +1154,115 @@ button {
 .custom-column-track {
   display: flex;
   min-width: 100%;
-  height: 100%;
+  height: 76px;
+  margin-top: 22px;
   flex: 0 0 auto;
   will-change: transform;
 }
-.custom-column {
+.enrichment-group-rail {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  left: 0;
+  height: 22px;
+  min-width: 100%;
+  pointer-events: none;
+}
+.enrichment-group {
+  position: absolute;
   display: flex;
+  height: 22px;
   align-items: center;
-  justify-content: space-between;
+  gap: 5px;
+  border-right: 1px solid color-mix(in srgb, var(--primary) 20%, var(--line));
+  border-bottom: 1px solid color-mix(in srgb, var(--primary) 20%, var(--line));
+  padding: 0 10px;
+  color: color-mix(in srgb, var(--primary) 85%, #3f4d5d);
+  background: color-mix(in srgb, var(--primary) 7%, #fff);
+  font-size: 10px;
+  font-weight: 700;
+  pointer-events: auto;
+}
+.enrichment-group-count {
+  color: color-mix(in srgb, var(--ink) 46%, transparent);
+  font-size: 9px;
+  font-weight: 600;
+}
+.custom-column {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
   flex: 0 0 auto;
-  padding: 0 13px;
+  padding: 0;
   border-right: 1px solid var(--line);
-  color: #596679;
+  color: #536173;
   font-size: 11px;
   font-weight: 700;
   cursor: grab;
   user-select: none;
 }
+.custom-column-main {
+  display: flex;
+  min-height: 43px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 13px;
+}
+.custom-column-status {
+  display: flex;
+  min-height: 31px;
+  align-items: center;
+  gap: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+  padding: 0 13px;
+  color: color-mix(in srgb, var(--ink) 56%, transparent);
+  font-size: 10px;
+  font-weight: 600;
+}
+.custom-column-progressbar {
+  display: block;
+  height: 4px;
+  min-width: 42px;
+  flex: 1 1 auto;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 16%, #fff);
+}
+.custom-column-progressbar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary);
+  transition: width 180ms ease-out;
+}
+.custom-column--active {
+  box-shadow: inset 1px 0 var(--primary), inset -1px 0 var(--primary);
+}
+.custom-column--active .custom-column-main {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 9%, #fff);
+}
+.computed-column-control {
+  opacity: 0;
+}
+.custom-column:hover .computed-column-control,
+.custom-column--active .computed-column-control {
+  opacity: 1;
+}
+.column-drag-hint {
+  margin-left: 2px;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+.custom-column:hover .column-drag-hint,
+.custom-column:active .column-drag-hint {
+  opacity: 1;
+}
 .custom-column:hover {
-  background: #f3f1ff;
-  color: #5147c7;
+  background: color-mix(in srgb, var(--primary) 5%, #fff);
+  color: var(--primary);
 }
 .custom-column:active {
   cursor: grabbing;
@@ -1188,6 +1277,44 @@ button {
   background: #fff;
   font-size: 11px;
   font-weight: 600;
+}
+.computed-cell-layer {
+  position: absolute;
+  z-index: 3;
+  top: 98px;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.computed-cell-state {
+  position: absolute;
+  display: flex;
+  height: 41px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  color: #64748b;
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 500;
+  background: color-mix(in srgb, #fff 97%, transparent);
+}
+.computed-cell-state--running {
+  color: var(--primary);
+  font-style: normal;
+}
+.computed-cell-state--failed {
+  color: var(--destructive);
+  font-style: normal;
+}
+.computed-cell-state--not_found,
+.computed-cell-state--skipped {
+  color: #94a3b8;
+}
+.computed-cell-state--stale {
+  color: color-mix(in srgb, var(--primary) 74%, #64748b);
 }
 .column-drag-hint {
   color: #b2bbc7;

@@ -1,4 +1,9 @@
-import type { AgentResponse, PloidAgentRequest, PloidResponse } from "./types";
+import type {
+  AgentResponse,
+  NormalizedPersonEnrichment,
+  PloidAgentRequest,
+  PloidResponse,
+} from "./types";
 import { PLOID_RESEARCH_PRESETS } from "./presets";
 import {
   isMockApiEnabled,
@@ -8,6 +13,24 @@ import {
 } from "./mock-service";
 
 const baseUrl = "https://api.ploid.com/v1";
+
+/** Enrichment names accepted by Ploid's focused person-enrichment endpoint. */
+export const PLOID_PERSON_ENRICHMENTS = [
+  "profile",
+  "email",
+  "phone",
+] as const;
+export type PloidPersonEnrichment =
+  (typeof PLOID_PERSON_ENRICHMENTS)[number];
+
+export function isPloidPersonEnrichment(
+  value: unknown,
+): value is PloidPersonEnrichment {
+  return (
+    typeof value === "string" &&
+    (PLOID_PERSON_ENRICHMENTS as readonly string[]).includes(value)
+  );
+}
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -68,19 +91,43 @@ export async function ploidFetch<T>(
 ) {
   const key = process.env.PLOID_API_KEY;
   if (!key) throw new Error("PLOID_API_KEY is not configured");
-  const response = await fetch(`${baseUrl}${path}`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${key}`,
-      "content-type": "application/json",
-      ...headers,
-    },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
+  const startedAt = performance.now();
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}${path}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${key}`,
+        "content-type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+  } catch (error) {
+    if (process.env.NODE_ENV !== "production")
+      console.warn("[Ploid request] transport failed", {
+        path,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        name: error instanceof Error ? error.name : undefined,
+        message: error instanceof Error ? error.message : String(error),
+        cause:
+          error instanceof Error && error.cause instanceof Error
+            ? error.cause.message
+            : undefined,
+      });
+    throw error;
+  }
   const payload = (await response.json().catch(() => null)) as {
     error?: { message?: string; code?: string };
   } | null;
+  if (!response.ok && process.env.NODE_ENV !== "production")
+    console.warn("[Ploid request] provider failed", {
+      path,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      status: response.status,
+      message: payload?.error?.message ?? payload?.error?.code,
+    });
   if (!response.ok)
     throw new PloidRequestError(
       payload?.error?.message ??
@@ -209,21 +256,52 @@ export async function enrichPerson(input: {
   linkedinUrl: string;
   firstName?: string;
   lastName?: string;
-  enrichments: Array<"profile" | "email" | "phone">;
+  enrichments: PloidPersonEnrichment[];
 }) {
   const validation = validateLinkedInUrl(input.linkedinUrl);
   if (validation) throw new Error(validation);
-  if (isMockApiEnabled()) return mockPersonEnrichment(input);
-  return ploidFetch<PloidResponse<unknown>>("/enrich", {
+  if (
+    !input.enrichments.length ||
+    input.enrichments.some((field) => !isPloidPersonEnrichment(field))
+  )
+    throw new Error("Allowed enrichments are profile, email, and phone");
+  if (process.env.NODE_ENV !== "production")
+    console.info("[Ploid enrich] request", {
+      enrichments: input.enrichments,
+      hasLinkedIn: Boolean(input.linkedinUrl.trim()),
+      hasFirstName: Boolean(input.firstName?.trim()),
+      hasLastName: Boolean(input.lastName?.trim()),
+    });
+  const response = isMockApiEnabled()
+    ? mockPersonEnrichment(input)
+    : await ploidFetch<PloidResponse<unknown>>("/enrich", {
     linkedin_url: input.linkedinUrl,
     ...(input.firstName ? { first_name: input.firstName } : {}),
     ...(input.lastName ? { last_name: input.lastName } : {}),
     enrichments: input.enrichments,
     response_format: "standard",
   });
+  const normalized = normalizePloidEnrichmentResponse(
+    response,
+    input.enrichments,
+  );
+  if (process.env.NODE_ENV !== "production")
+    console.info("[Ploid enrich] response", {
+      requested: input.enrichments,
+      success: Object.entries(normalized.fields)
+        .filter(([, field]) => field?.status === "success")
+        .map(([field]) => field),
+      unresolved: Object.entries(normalized.fields)
+        .filter(([, field]) => field?.status !== "success")
+        .map(([field]) => field),
+      warnings: normalized.warnings.length,
+      requestId: normalized.requestId,
+    });
+  return normalized;
 }
 
 export function validateLinkedInUrl(value: string) {
+  if (!value.trim()) return "Missing LinkedIn URL";
   try {
     const url = new URL(value.trim());
     const host = url.hostname.toLowerCase().replace(/^www\./, "");
@@ -232,7 +310,71 @@ export function validateLinkedInUrl(value: string) {
   } catch {
     // fall through to the user-facing validation message
   }
-  return "Missing LinkedIn URL";
+  return "Invalid LinkedIn profile URL";
+}
+
+const record = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+/**
+ * The documented response keeps output fields in `data` and provider issues
+ * in `meta.warnings`. We only call a warning field-specific when it explicitly
+ * names that field, rather than assuming an undocumented warning shape.
+ */
+const warningNamesField = (warning: unknown, field: PloidPersonEnrichment) => {
+  const details = record(warning);
+  if (!details) return false;
+  return [details.field, details.enrichment, details.output].some(
+    (value) => value === field,
+  );
+};
+
+export function normalizePloidEnrichmentResponse(
+  raw: PloidResponse<unknown>,
+  requested: PloidPersonEnrichment[],
+): NormalizedPersonEnrichment {
+  const data = record(raw.data) ?? {};
+  const warnings = Array.isArray(raw.meta.warnings) ? raw.meta.warnings : [];
+  return {
+    fields: Object.fromEntries(
+      requested.map((field) => {
+        // The live focused-enrichment response names the selected LinkedIn
+        // profile payload `linkedin_profile`; internally we normalize it to
+        // the requested `profile` field alongside email and phone.
+        const providerValue =
+          field === "profile"
+            ? (data.profile ?? data.linkedin_profile ?? null)
+            : (data[field] ?? null);
+        // OpenAPI defines email and phone as EnrichContact objects; normalize
+        // their documented `value` rather than leaking provider envelopes into
+        // email/phone cells.
+        const value = field === "profile"
+          ? providerValue
+          : (record(providerValue)?.value ?? providerValue);
+        return [
+          field,
+          {
+            value,
+            status:
+              value !== null
+                ? "success"
+                : warnings.some((warning) => warningNamesField(warning, field))
+                  ? "failed"
+                  : "not_found",
+          },
+        ];
+      }),
+    ),
+    warnings,
+    requestId: typeof raw.meta.request_id === "string" ? raw.meta.request_id : undefined,
+    creditsCharged:
+      typeof raw.meta.credits_charged === "number"
+        ? raw.meta.credits_charged
+        : undefined,
+    raw,
+  };
 }
 
 export const PLOID_SOCIAL_PLATFORMS = [
@@ -258,6 +400,8 @@ const SOCIAL_URL_HOSTS: Record<PloidSocialPlatform, readonly string[]> = {
   reddit: ["reddit.com"],
   facebook: ["facebook.com", "fb.com"],
 };
+
+console.log("This is present and entering here")
 
 /** Returns a user-facing validation error before an avoidable Social API call. */
 export function validateSocialIdentifier(
