@@ -12,7 +12,7 @@ from .instagram_search import (
     extract_instagram_username, normalize_instagram_url,
     search_instagram_candidate_context,
     search_indexed_linkedin_profile, search_instagram_web, search_public_identity_context,
-    search_public_social_aliases,
+    search_fallback_social_profiles, search_public_social_aliases,
 )
 from .linkedin_profile import (
     enrich_identity_from_public_context, fallback_identity_from_url, fetch_linkedin_profile,
@@ -321,6 +321,14 @@ def _verification_summary(best, second):
     }
 
 
+def _find_social_fallback(identity):
+    """Keep an optional fallback lookup failure from discarding Instagram results."""
+    try:
+        return search_fallback_social_profiles(identity)
+    except Exception:
+        return {}
+
+
 def find_instagram_from_linkedin(linkedin_url, fallback=False):
     """Resolve one known LinkedIn identity to an Instagram profile, if unambiguous."""
     if fallback:
@@ -347,6 +355,7 @@ def find_instagram_from_linkedin(linkedin_url, fallback=False):
     ranked = _rerank_with_faces(identity, ranked)
     result = {
         "status": "not_found", "linkedin": identity, "instagram": None,
+        "social_fallback": {},
         "candidates": ranked,
         "stats": {
             "queries_run": len(queries),
@@ -360,6 +369,7 @@ def find_instagram_from_linkedin(linkedin_url, fallback=False):
         },
     }
     if not ranked:
+        result["social_fallback"] = _find_social_fallback(identity)
         return result
     best, second = ranked[0], ranked[1] if len(ranked) > 1 else None
     face_verified = (
@@ -416,4 +426,5 @@ def find_instagram_from_linkedin(linkedin_url, fallback=False):
         result.update(status="matched", instagram=best)
     else:
         result["status"] = "ambiguous"
+        result["social_fallback"] = _find_social_fallback(identity)
     return result

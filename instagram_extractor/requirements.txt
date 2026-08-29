@@ -4,6 +4,7 @@
 ddgs
 linkedin-scraper
 python-dotenv
+openpyxl>=3.0,<4
 # Optional local LinkedIn-avatar to Instagram-avatar reranking.
 numpy>=1.24,<2
 scipy>=1.10,<1.12

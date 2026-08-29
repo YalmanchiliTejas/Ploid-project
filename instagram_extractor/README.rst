@@ -150,6 +150,16 @@ Instagram handle, gathers newly indexed profile/post context and photos, and
 then reruns face comparison and the normal verification gates. Batch runs can
 reprocess older ambiguous/inconclusive records with ``--retry-ambiguous``.
 
+The batch command also writes an Excel workbook beside its JSON output after
+each completed lookup. ``Final Accounts`` contains confirmed Instagram
+matches, while ``All Results`` includes every input and labels an ambiguous
+leading account as ``potential`` for review. Use ``--excel-output PATH`` to
+choose a different workbook location.
+
+If no Instagram account can be confirmed, the resolver also searches for an
+exact-name Twitter/X profile and Facebook profile. Any links found are saved
+under ``social_fallback`` in JSON and in dedicated columns in ``All Results``.
+
 The quality gates can be adjusted in ``.env``::
 
    FACE_MATCH_MIN_FACE_SIZE=64

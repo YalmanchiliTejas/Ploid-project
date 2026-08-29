@@ -7,6 +7,7 @@ from app.backend.enrichment.instagram_matching import score_instagram_candidate
 from app.backend.enrichment.instagram_search import (
     build_instagram_queries, build_refined_instagram_queries,
     extract_instagram_username, normalize_instagram_url,
+    normalize_social_profile_url, search_fallback_social_profiles,
     search_instagram_candidate_context, search_public_social_aliases,
 )
 from app.backend.enrichment.profile_avatar import extract_advertised_images, extract_og_image
@@ -49,6 +50,12 @@ class TestInstagramEnrichment(unittest.TestCase):
         )
         alias_patcher.start()
         self.addCleanup(alias_patcher.stop)
+        fallback_patcher = patch(
+            "app.backend.enrichment.pipeline.search_fallback_social_profiles",
+            return_value={},
+        )
+        fallback_patcher.start()
+        self.addCleanup(fallback_patcher.stop)
         context_patcher = patch(
             "app.backend.enrichment.pipeline.search_instagram_candidate_context",
             return_value={},
@@ -126,6 +133,38 @@ class TestInstagramEnrichment(unittest.TestCase):
         self.assertEqual(extract_instagram_username("https://www.instagram.com/johnsmith/"), "johnsmith")
         self.assertIsNone(normalize_instagram_url("https://instagram.com/p/post-id/"))
         self.assertIsNone(normalize_instagram_url("https://example.com/johnsmith"))
+
+    def test_normalizes_only_twitter_and_facebook_profile_urls(self):
+        self.assertEqual(
+            normalize_social_profile_url("https://twitter.com/johnsmith/status/1", "twitter"),
+            None,
+        )
+        self.assertEqual(
+            normalize_social_profile_url("https://twitter.com/johnsmith", "twitter"),
+            "https://x.com/johnsmith/",
+        )
+        self.assertEqual(
+            normalize_social_profile_url("https://facebook.com/john.smith", "facebook"),
+            "https://www.facebook.com/john.smith/",
+        )
+        self.assertIsNone(
+            normalize_social_profile_url("https://facebook.com/groups/example", "facebook")
+        )
+
+    @patch("app.backend.enrichment.instagram_search._search_web")
+    def test_finds_social_fallback_profiles_with_visible_exact_name(self, mock_search):
+        mock_search.side_effect = lambda query: ([{
+            "link": "https://x.com/johnsmith",
+            "title": "John Smith (@johnsmith) / X",
+            "snippet": "Software engineer at Google in San Francisco",
+        }] if "x.com" in query else [{
+            "link": "https://facebook.com/john.smith",
+            "title": "John Smith | Facebook",
+            "snippet": "Google",
+        }])
+        found = search_fallback_social_profiles(IDENTITY)
+        self.assertEqual(found["twitter"]["url"], "https://x.com/johnsmith/")
+        self.assertEqual(found["facebook"]["url"], "https://www.facebook.com/john.smith/")
 
     def test_rejects_linkedin_section_labels_as_profile_names(self):
         for value in ("About", "Experience", "Education", "Sign in"):

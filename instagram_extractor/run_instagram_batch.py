@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -20,6 +21,9 @@ def _record(linkedin_url, fallback):
         result = find_instagram_from_linkedin(linkedin_url, fallback=fallback)
         instagram = result.get("instagram") or {}
         identity = result.get("linkedin") or {}
+        social_fallback = result.get("social_fallback") or {}
+        twitter = social_fallback.get("twitter") or {}
+        facebook = social_fallback.get("facebook") or {}
         candidates = result.get("candidates") or []
         leading_candidate = candidates[0] if candidates else {}
         return {
@@ -43,6 +47,11 @@ def _record(linkedin_url, fallback):
             "potential_instagram_url": leading_candidate.get("url"),
             "potential_instagram_username": leading_candidate.get("username"),
             "potential_score": leading_candidate.get("score"),
+            "twitter_url": twitter.get("url"),
+            "twitter_username": twitter.get("username"),
+            "facebook_url": facebook.get("url"),
+            "facebook_username": facebook.get("username"),
+            "social_fallback": social_fallback,
             "linkedin_extracted": {
                 "name": identity.get("name"),
                 "headline": identity.get("headline"),
@@ -107,6 +116,122 @@ def _write_output(path, urls, records):
     os.replace(temporary, path)
 
 
+_EXCEL_COLUMNS = (
+    ("Name", "name"),
+    ("LinkedIn URL", "linkedin_url"),
+    ("Status", "status"),
+    ("Instagram Username", "instagram_username"),
+    ("Instagram URL", "instagram_url"),
+    ("Account Type", "account_type"),
+    ("Twitter/X URL", "twitter_url"),
+    ("Facebook URL", "facebook_url"),
+    ("Score", "score"),
+    ("Confidence", "confidence"),
+    ("Current Company", "current_company"),
+    ("Current Title", "current_title"),
+    ("Location", "location"),
+    ("Face Outcome", "face_outcome"),
+    ("Face Similarity", "face_similarity"),
+    ("Error", "error"),
+)
+
+
+def _excel_path(json_path, configured_path=None):
+    """Return the configured workbook path or place it beside the JSON output."""
+    if configured_path:
+        return configured_path
+    return str(Path(json_path).with_suffix(".xlsx"))
+
+
+def _spreadsheet_row(record, include_potential=False):
+    """Flatten one final batch record into spreadsheet-friendly columns."""
+    identity = record.get("linkedin_extracted") or {}
+    instagram_url = record.get("instagram_url")
+    instagram_username = record.get("instagram_username")
+    score = record.get("score")
+    account_type = "confirmed" if instagram_url else ""
+    if not instagram_url and include_potential:
+        instagram_url = record.get("potential_instagram_url")
+        instagram_username = record.get("potential_instagram_username")
+        score = record.get("potential_score")
+        account_type = "potential" if instagram_url else ""
+    return {
+        "name": identity.get("name"),
+        "linkedin_url": record.get("linkedin_url"),
+        "status": record.get("status"),
+        "instagram_username": instagram_username,
+        "instagram_url": instagram_url,
+        "account_type": account_type,
+        "twitter_url": record.get("twitter_url"),
+        "facebook_url": record.get("facebook_url"),
+        "score": score,
+        "confidence": record.get("confidence"),
+        "current_company": identity.get("current_company"),
+        "current_title": identity.get("current_title"),
+        "location": identity.get("location"),
+        "face_outcome": record.get("face_outcome"),
+        "face_similarity": record.get("face_similarity"),
+        "error": record.get("error"),
+    }
+
+
+def _safe_excel_value(value):
+    """Prevent untrusted profile text from being interpreted as an Excel formula."""
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def _add_excel_sheet(workbook, title, rows):
+    from openpyxl.styles import Font
+
+    sheet = workbook.create_sheet(title)
+    sheet.append([heading for heading, _ in _EXCEL_COLUMNS])
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        sheet.append([
+            _safe_excel_value(row.get(field)) for _, field in _EXCEL_COLUMNS
+        ])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    sheet.column_dimensions["A"].width = 24
+    sheet.column_dimensions["B"].width = 42
+    sheet.column_dimensions["C"].width = 14
+    sheet.column_dimensions["D"].width = 24
+    sheet.column_dimensions["E"].width = 42
+    sheet.column_dimensions["G"].width = 36
+    sheet.column_dimensions["H"].width = 42
+    for column in (2, 5, 7, 8):
+        for cell in list(sheet.columns)[column - 1][1:]:
+            if isinstance(cell.value, str) and cell.value.startswith(("http://", "https://")):
+                cell.hyperlink = cell.value
+                cell.style = "Hyperlink"
+    return sheet
+
+
+def _write_excel(path, urls, records):
+    """Atomically export confirmed accounts and the complete review queue."""
+    from openpyxl import Workbook
+
+    profiles = [records[url] for url in urls if url in records]
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    _add_excel_sheet(
+        workbook,
+        "Final Accounts",
+        [_spreadsheet_row(profile) for profile in profiles if profile.get("instagram_url")],
+    )
+    _add_excel_sheet(
+        workbook,
+        "All Results",
+        [_spreadsheet_row(profile, include_potential=True) for profile in profiles],
+    )
+    temporary = str(path) + ".tmp.xlsx"
+    workbook.save(temporary)
+    os.replace(temporary, path)
+
+
 def _existing_records(path):
     try:
         with open(path, encoding="utf-8") as source:
@@ -143,6 +268,10 @@ def main():
     parser.add_argument("input", nargs="?", default="linkedin_urls.txt", help="one LinkedIn URL per line")
     parser.add_argument("--output", default="instagram_profiles.json", help="combined JSON output path")
     parser.add_argument(
+        "--excel-output",
+        help="Excel output path (default: the JSON output name with an .xlsx extension)",
+    )
+    parser.add_argument(
         "--fallback",
         action="store_true",
         help="Do not call LinkedIn; derive limited search terms from each public URL.",
@@ -161,6 +290,7 @@ def main():
     )
     args = parser.parse_args()
     load_dotenv()
+    excel_output = _excel_path(args.output, args.excel_output)
 
     urls = _urls(args.input)
     records = {} if args.restart else _existing_records(args.output)
@@ -192,6 +322,7 @@ def main():
             attempted = future.result()
             records[url] = _retry_result(records.get(url), attempted)
             _write_output(args.output, urls, records)
+            _write_excel(excel_output, urls, records)
             record = records[url]
             identity = record.get("linkedin_extracted") or {}
             displayed_match = record.get("instagram_url")
@@ -215,7 +346,9 @@ def main():
             )
 
     _write_output(args.output, urls, records)
+    _write_excel(excel_output, urls, records)
     print("Wrote {} profiles to {}".format(len(records), args.output))
+    print("Wrote Excel results to {}".format(excel_output))
 
 
 if __name__ == "__main__":

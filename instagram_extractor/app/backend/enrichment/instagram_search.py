@@ -6,6 +6,13 @@ from urllib.parse import urlparse
 
 _NON_PROFILE_PATHS = {"p", "reel", "reels", "explore", "stories", "accounts", "direct"}
 _POST_PATHS = {"p", "reel", "reels", "tv"}
+_TWITTER_NON_PROFILE_PATHS = {
+    "compose", "explore", "home", "i", "intent", "login", "search", "settings", "share",
+}
+_FACEBOOK_NON_PROFILE_PATHS = {
+    "about", "business", "events", "gaming", "groups", "help", "login", "marketplace",
+    "pages", "photo", "photos", "reel", "reels", "share", "stories", "watch",
+}
 
 
 def normalize_instagram_url(url):
@@ -28,6 +35,42 @@ def extract_instagram_username(url):
     """Return the username from a valid Instagram profile URL, else None."""
     normalized = normalize_instagram_url(url)
     return normalized.rstrip("/").rsplit("/", 1)[-1] if normalized else None
+
+
+def normalize_social_profile_url(url, platform):
+    """Return a canonical Twitter/X or Facebook profile URL, excluding content URLs."""
+    value = (url or "").strip()
+    parsed = urlparse(value if "://" in value else "https://" + value)
+    host = (parsed.hostname or "").lower().removeprefix("www.").removeprefix("mobile.")
+    parts = [part for part in parsed.path.split("/") if part]
+    if platform == "twitter":
+        if host not in {"twitter.com", "x.com"} or len(parts) != 1:
+            return None
+        username = parts[0].lstrip("@")
+        if (
+            username.lower() in _TWITTER_NON_PROFILE_PATHS
+            or not re.fullmatch(r"[a-zA-Z0-9_]{1,15}", username)
+        ):
+            return None
+        return "https://x.com/{}/".format(username)
+    if platform == "facebook":
+        if host not in {"facebook.com", "fb.com"}:
+            return None
+        if parsed.path.rstrip("/").lower() == "/profile.php":
+            profile_id = (parsed.query or "").split("&", 1)[0]
+            if re.fullmatch(r"id=\d+", profile_id):
+                return "https://www.facebook.com/profile.php?{}".format(profile_id)
+            return None
+        if len(parts) != 1:
+            return None
+        username = parts[0]
+        if (
+            username.lower() in _FACEBOOK_NON_PROFILE_PATHS
+            or not re.fullmatch(r"[a-zA-Z0-9.]{3,80}", username)
+        ):
+            return None
+        return "https://www.facebook.com/{}/".format(username)
+    raise ValueError("unsupported social platform: {}".format(platform))
 
 
 def _quoted(value):
@@ -331,6 +374,72 @@ def search_public_social_aliases(name):
             if key not in existing_keys:
                 alias["supporting_results"].append(supporting_result)
     return list(aliases.values())
+
+
+def search_fallback_social_profiles(identity):
+    """Find the best indexed Twitter/X and Facebook profiles for an identity.
+
+    Links are returned only when the search result itself visibly contains the
+    exact full name. Workplace, school, location, and matching slugs improve
+    ranking but are not accepted as substitutes for the identity name.
+    """
+    name = (identity.get("name") or "").strip()
+    if not name:
+        return {}
+    context_terms = list(dict.fromkeys(
+        value.strip() for value in (
+            identity.get("current_company") or "",
+            (identity.get("schools") or [""])[0],
+            identity.get("location") or "",
+        )
+        if isinstance(value, str) and value.strip()
+    ))
+    compact_name = re.sub(r"[^a-z0-9]", "", name.lower())
+    public_id = re.sub(r"[^a-z0-9]", "", (identity.get("public_id") or "").lower())
+    output = {}
+    for platform, domains in (
+        ("twitter", ("x.com", "twitter.com")),
+        ("facebook", ("facebook.com",)),
+    ):
+        queries = [
+            "site:{} {}".format(domain, _quoted(name)) for domain in domains
+        ]
+        queries.extend(
+            "site:{} {} {}".format(domain, _quoted(name), _quoted(term))
+            for domain in domains for term in context_terms[:2]
+        )
+        candidates = {}
+        for query in dict.fromkeys(queries):
+            for item in _search_web(query):
+                normalized_url = normalize_social_profile_url(item.get("link", ""), platform)
+                if not normalized_url:
+                    continue
+                combined = " ".join((item.get("title", ""), item.get("snippet", "")))
+                if not _mentions(combined, name):
+                    continue
+                parsed = urlparse(normalized_url)
+                slug = parsed.path.strip("/").lower()
+                compact_slug = re.sub(r"[^a-z0-9]", "", slug)
+                matched_context = [term for term in context_terms if _mentions(combined, term)]
+                score = 3 + len(matched_context)
+                if compact_slug and compact_slug in {compact_name, public_id}:
+                    score += 2
+                candidate = {
+                    "url": normalized_url,
+                    "username": slug or None,
+                    "score": score,
+                    "matched_context": matched_context,
+                    "title": item.get("title", ""),
+                    "snippet": item.get("snippet", ""),
+                }
+                previous = candidates.get(normalized_url)
+                if previous is None or candidate["score"] > previous["score"]:
+                    candidates[normalized_url] = candidate
+        if candidates:
+            output[platform] = max(
+                candidates.values(), key=lambda candidate: (candidate["score"], candidate["url"])
+            )
+    return output
 
 
 def search_indexed_linkedin_profile(public_id, derived_name=""):
